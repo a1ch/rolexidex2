@@ -10,6 +10,8 @@ from typing import Any
 import pandas as pd
 from apify_client import ApifyClient
 
+from fake_detection import compute_fake_risk
+
 
 # Default search queries for "fancy" / luxury watches
 DEFAULT_WATCH_QUERIES = [
@@ -159,6 +161,11 @@ def score_deal(item: dict[str, Any]) -> dict[str, Any]:
     out["trend_score"] = trend_score
     out["deal_score"] = deal_score
     out["sold_count_num"] = sold
+
+    risk = compute_fake_risk(out)
+    out["fake_risk_score"] = risk["fake_risk_score"]
+    out["fake_risk_level"] = risk["fake_risk_level"]
+    out["fake_reasons"] = risk["fake_reasons"]
     return out
 
 

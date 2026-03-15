@@ -24,7 +24,7 @@ st.set_page_config(
     page_title="Luxury Watch Deals | AI Rankings",
     page_icon="⌚",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="collapsed",
 )
 
 # Secrets: Streamlit Cloud + .streamlit/secrets.toml (root keys). Env vars as fallback.
@@ -37,6 +37,14 @@ def _get_secret(key: str) -> str:
     except (AttributeError, TypeError, FileNotFoundError):
         pass
     return os.environ.get(key, "").strip()
+
+
+def _ai_error_message(e: Exception) -> str:
+    """User-friendly message when AI (OpenAI/Anthropic) fails."""
+    s = str(e).lower()
+    if "429" in s or "quota" in s or "insufficient_quota" in s or "rate limit" in s:
+        return "That provider’s quota/limits are hit. Switch to **Anthropic** in the sidebar (or add credits to OpenAI). Rule-based ranking still works without AI."
+    return str(e)
 
 
 # Custom CSS
@@ -52,19 +60,35 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 
+def _ensure_fake_risk(df: pd.DataFrame) -> pd.DataFrame:
+    """Add fake_risk_score/level/reasons if missing (e.g. loaded from DB)."""
+    if "fake_risk_score" in df.columns:
+        return df
+    from fake_detection import compute_fake_risk
+    rows = df.to_dict("records")
+    for r in rows:
+        risk = compute_fake_risk(r)
+        r["fake_risk_score"] = risk["fake_risk_score"]
+        r["fake_risk_level"] = risk["fake_risk_level"]
+        r["fake_reasons"] = risk["fake_reasons"]
+    return pd.DataFrame(rows)
+
+
 def _render_rule_based(df: pd.DataFrame) -> None:
     """Rule-based ranking view."""
     st.subheader("Rankings by deal score (rule-based)")
-    st.caption("Formula: 35% price/discount + 30% condition + 20% seller feedback + 15% popularity.")
+    st.caption("Formula: 35% price/discount + 30% condition + 20% seller feedback + 15% popularity. **Fake risk** = rule-based replica/fake detection.")
     display_cols = [
-        "deal_score", "title", "priceString", "listPriceString", "discount_pct",
+        "deal_score", "fake_risk_score", "fake_risk_level", "title", "priceString", "listPriceString", "discount_pct",
         "condition_normalized", "sellerFeedbackPercent", "soldCount", "listingType", "url",
     ]
     available = [c for c in display_cols if c in df.columns]
     st.dataframe(
-        df[available].head(100),
+        df[available].head(1000),
         column_config={
             "deal_score": st.column_config.NumberColumn("Deal score", format="%.1f"),
+            "fake_risk_score": st.column_config.NumberColumn("Fake risk", format="%.0f"),
+            "fake_risk_level": st.column_config.TextColumn("Risk level"),
             "title": st.column_config.TextColumn("Title", width="large"),
             "priceString": st.column_config.TextColumn("Price"),
             "listPriceString": st.column_config.TextColumn("List price"),
@@ -73,7 +97,7 @@ def _render_rule_based(df: pd.DataFrame) -> None:
             "sellerFeedbackPercent": st.column_config.TextColumn("Seller %"),
             "soldCount": st.column_config.TextColumn("Sold"),
             "listingType": st.column_config.TextColumn("Type"),
-            "url": st.column_config.LinkColumn("Link", display_text="eBay"),
+            "url": st.column_config.LinkColumn("View auction", display_text="→ Open"),
         },
         use_container_width=True,
         hide_index=True,
@@ -93,14 +117,15 @@ def _render_ai_ranking(df: pd.DataFrame) -> None:
     st.caption("Scores from LLM: quality, pricing, trends, and overall deal assessment.")
     display_cols = [
         "ai_overall_score", "ai_quality_score", "ai_pricing_score", "ai_trend_score",
-        "title", "priceString", "listPriceString", "ai_summary", "condition_normalized",
-        "sellerFeedbackPercent", "url",
+        "ai_authenticity_risk", "title", "priceString", "listPriceString", "ai_summary",
+        "condition_normalized", "sellerFeedbackPercent", "url",
     ]
     available = [c for c in display_cols if c in df_ai.columns]
     st.dataframe(
-        df_ai[available].head(100),
+        df_ai[available].head(1000),
         column_config={
             "ai_overall_score": st.column_config.NumberColumn("AI overall", format="%.1f"),
+            "ai_authenticity_risk": st.column_config.NumberColumn("AI authenticity (10=likely genuine)", format="%.1f"),
             "ai_quality_score": st.column_config.NumberColumn("Quality", format="%.1f"),
             "ai_pricing_score": st.column_config.NumberColumn("Pricing", format="%.1f"),
             "ai_trend_score": st.column_config.NumberColumn("Trend", format="%.1f"),
@@ -110,7 +135,7 @@ def _render_ai_ranking(df: pd.DataFrame) -> None:
             "ai_summary": st.column_config.TextColumn("AI summary", width="medium"),
             "condition_normalized": st.column_config.TextColumn("Condition"),
             "sellerFeedbackPercent": st.column_config.TextColumn("Seller %"),
-            "url": st.column_config.LinkColumn("Link", display_text="eBay"),
+            "url": st.column_config.LinkColumn("View auction", display_text="→ Open"),
         },
         use_container_width=True,
         hide_index=True,
@@ -128,6 +153,10 @@ def _render_datasheets(df: pd.DataFrame, use_ai: bool) -> None:
         else:
             label = f"#{i+1} — {title_short}… | Score: {row['deal_score']}"
         with st.expander(label):
+            url = row.get("url") or ""
+            title_full = (row.get("title") or "").strip()
+            if url and title_full:
+                st.markdown(f"[**{title_full}**]({url})")
             col_a, col_b = st.columns(2)
             with col_a:
                 if row.get("thumbnail"):
@@ -139,6 +168,8 @@ def _render_datasheets(df: pd.DataFrame, use_ai: bool) -> None:
                     st.write("**Trend:**", f"{row.get('ai_trend_score', '—'):.1f}" if pd.notna(row.get("ai_trend_score")) else "—")
                     if row.get("ai_summary"):
                         st.caption(f"*{row['ai_summary']}*")
+                    if pd.notna(row.get("ai_authenticity_risk")):
+                        st.write("**AI authenticity:**", f"{row['ai_authenticity_risk']:.1f}/10", "—", row.get("ai_authenticity_note") or "")
                 else:
                     st.metric("Deal score", f"{row['deal_score']}")
                 st.write("**Price:**", row.get("priceString", "—"))
@@ -150,6 +181,15 @@ def _render_datasheets(df: pd.DataFrame, use_ai: bool) -> None:
                 st.write("**Feedback:**", row.get("sellerFeedbackPercent", "—"))
                 st.write("**Sold:**", row.get("soldCount", "—"))
                 st.write("**Type:**", row.get("listingType", "—"))
+                risk = row.get("fake_risk_score")
+                level = row.get("fake_risk_level", "")
+                if pd.notna(risk):
+                    color = "red" if level == "high" else "orange" if level == "medium" else "green"
+                    st.markdown(f"**Fake risk:** :{color}[{risk:.0f} — {level}]")
+                    reasons = row.get("fake_reasons") or []
+                    if reasons:
+                        for r in reasons[:3]:
+                            st.caption(f"• {r}")
             if row.get("url"):
                 st.link_button("Open on eBay", row["url"], type="secondary")
 
@@ -262,8 +302,8 @@ def main():
             value="\n".join(DEFAULT_WATCH_QUERIES),
             height=120,
         )
-        max_products = st.slider("Max products per query", 10, 200, 50)
-        max_pages = st.slider("Max pages per query", 1, 10, 3)
+        max_products = st.slider("Max products per query", 10, 3000, 500)
+        max_pages = st.slider("Max pages per query", 1, 20, 5)
         listing_type = st.selectbox("Listing type", ["all", "buy_it_now", "auction"], index=0)
         col1, col2 = st.columns(2)
         with col1:
@@ -369,7 +409,7 @@ def main():
                         st.session_state["watch_df_ai"] = df_ai
                         st.success("AI ranking complete.")
                     except Exception as e:
-                        st.error(f"AI failed: {e}")
+                        st.error("AI failed: " + _ai_error_message(e))
 
     # "Refresh data" button: re-scrape and save to DB (use 1–2x/day to save load time)
     refresh_clicked = st.sidebar.button("Refresh data (re-scrape & save)", use_container_width=True)
@@ -407,8 +447,8 @@ def main():
                                         df_ai = items_to_dataframe_ai(scored)
                                         st.session_state["watch_df"] = df_ai
                                         st.session_state["watch_df_ai"] = df_ai
-                                    except Exception:
-                                        pass
+                                    except Exception as e:
+                                        st.warning("AI after refresh failed: " + _ai_error_message(e))
                     else:
                         st.warning("No results from scrape.")
                 except Exception as e:
@@ -442,11 +482,22 @@ def main():
                     st.session_state["watch_df_ai"] = df_ai
                     st.success("AI ranking complete.")
                 except Exception as e:
-                    st.error(f"AI analysis failed: {e}")
+                    st.error("AI analysis failed: " + _ai_error_message(e))
 
     # Use AI dataframe if available
     df = st.session_state.get("watch_df_ai", df)
     has_ai = "ai_overall_score" in df.columns and df["ai_overall_score"].notna().any()
+
+    # Ensure fake-risk columns (for DB-loaded data) and apply sort preference
+    df_rule = _ensure_fake_risk(st.session_state["watch_df"].copy())
+    sort_order = st.radio(
+        "Listing order",
+        ["Best deals first", "Safest first (low fake risk)"],
+        horizontal=True,
+        key="sort_order",
+    )
+    if sort_order == "Safest first (low fake risk)":
+        df_rule = df_rule.sort_values("fake_risk_score", ascending=True).reset_index(drop=True)
 
     # Last updated + stale warning
     last_for_admin: str | None = None
@@ -476,7 +527,8 @@ def main():
 
     # Overview metrics
     st.subheader("Overview")
-    c1, c2, c3, c4, c5 = st.columns(5)
+    high_risk = (df_rule["fake_risk_score"] >= 60).sum() if "fake_risk_score" in df_rule.columns else 0
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     with c1:
         st.metric("Listings", len(df))
     with c2:
@@ -488,19 +540,26 @@ def main():
     with c5:
         if has_ai:
             st.metric("Avg AI score", f"{df['ai_overall_score'].mean():.1f}")
+    with c6:
+        st.metric("High fake risk", high_risk)
 
     tab1, tab2, tab3, tab4 = st.tabs(
         ["Rule-based ranking", "AI ranking", "Datasheets", "Data & admin"]
     )
     with tab1:
-        _render_rule_based(st.session_state["watch_df"])
+        _render_rule_based(df_rule)
     with tab2:
         _render_ai_ranking(df)
     with tab3:
         st.subheader("Watch datasheets (top deals)")
-        view = st.radio("Sort by", ["Rule-based score", "AI score"], horizontal=True)
+        view = st.radio("Sort by", ["Rule-based score", "AI score", "Safest first"], horizontal=True)
         if view == "AI score" and has_ai:
             _render_datasheets(df, use_ai=True)
+        elif view == "Safest first":
+            safest = _ensure_fake_risk(st.session_state["watch_df"].copy()).sort_values(
+                "fake_risk_score", ascending=True
+            ).reset_index(drop=True)
+            _render_datasheets(safest, use_ai=False)
         else:
             _render_datasheets(st.session_state["watch_df"], use_ai=False)
     with tab4:

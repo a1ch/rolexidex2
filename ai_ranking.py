@@ -81,6 +81,8 @@ def _parse_ai_response(text: str, n_expected: int) -> list[dict[str, Any]]:
                 "trend_score": _safe_float(row.get("trend_score") or row.get("trend")),
                 "overall_ai_score": _safe_float(row.get("overall_ai_score") or row.get("overall_score") or row.get("overall")),
                 "summary": _safe_str(row.get("summary") or row.get("one_line") or row.get("reason")),
+                "authenticity_risk": _safe_float(row.get("authenticity_risk") or row.get("authenticity") or 5.0),
+                "authenticity_note": _safe_str(row.get("authenticity_note") or row.get("auth_note") or ""),
             })
         else:
             result.append({
@@ -89,6 +91,8 @@ def _parse_ai_response(text: str, n_expected: int) -> list[dict[str, Any]]:
                 "trend_score": 5.0,
                 "overall_ai_score": 5.0,
                 "summary": "",
+                "authenticity_risk": 5.0,
+                "authenticity_note": "",
             })
     return result
 
@@ -158,9 +162,11 @@ For each listing index 0 to {len(subset)-1}, provide:
 3. trend_score (1-10): demand/popularity from seller feedback and sold count.
 4. overall_ai_score (1-10): overall deal quality combining quality, pricing, and trend.
 5. summary: one short sentence (max 15 words) on why it's a good or weak deal.
+6. authenticity_risk (1-10): risk of replica/fake — 10 = likely genuine, 1 = strong red flags (e.g. "replica", "homage", unrealistically low price, sketchy seller).
+7. authenticity_note: one short phrase (e.g. "Looks legit" or "Replica keywords in title").
 
 Return ONLY a JSON array of objects, one per listing in order. No other text.
-Example format: [{{"quality_score": 7, "pricing_score": 8, "trend_score": 6, "overall_ai_score": 7, "summary": "Strong discount, trusted seller."}}, ...]
+Example: [{{"quality_score": 7, "pricing_score": 8, "trend_score": 6, "overall_ai_score": 7, "summary": "Strong discount.", "authenticity_risk": 8, "authenticity_note": "No red flags"}}, ...]
 """
 
     if provider == "openai":
@@ -203,12 +209,16 @@ Example format: [{{"quality_score": 7, "pricing_score": 8, "trend_score": 6, "ov
             out["ai_trend_score"] = p["trend_score"]
             out["ai_overall_score"] = p["overall_ai_score"]
             out["ai_summary"] = p["summary"]
+            out["ai_authenticity_risk"] = p.get("authenticity_risk", 5.0)
+            out["ai_authenticity_note"] = p.get("authenticity_note", "")
         else:
             out["ai_quality_score"] = None
             out["ai_pricing_score"] = None
             out["ai_trend_score"] = None
             out["ai_overall_score"] = None
             out["ai_summary"] = None
+            out["ai_authenticity_risk"] = None
+            out["ai_authenticity_note"] = None
         result.append(out)
     return result
 
