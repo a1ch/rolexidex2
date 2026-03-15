@@ -17,6 +17,7 @@ from ai_ranking import (
     run_ai_ranking_anthropic,
     items_to_dataframe_ai,
 )
+from database import get_engine, init_db, get_listings, save_listings, get_last_scraped_at
 
 st.set_page_config(
     page_title="Luxury Watch Deals | AI Rankings",
@@ -25,15 +26,16 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Secrets: Streamlit Cloud uses st.secrets; local can use env or sidebar input
-def _get_secret(key: str, sidebar_default: str = "") -> str:
+# Secrets: Streamlit Cloud + .streamlit/secrets.toml (root keys). Env vars as fallback.
+def _get_secret(key: str) -> str:
+    """Get API key from Streamlit secrets or environment. Returns empty if not set."""
     try:
-        val = st.secrets.get(key, "")
-        if val:
-            return val
-    except Exception:
+        if key in st.secrets:
+            val = st.secrets[key]
+            return str(val).strip() if val else ""
+    except (AttributeError, TypeError, FileNotFoundError):
         pass
-    return os.environ.get(key, sidebar_default)
+    return os.environ.get(key, "").strip()
 
 
 # Custom CSS
@@ -158,12 +160,15 @@ def main():
     # Sidebar
     with st.sidebar:
         st.header("Settings")
-        api_key = st.text_input(
-            "Apify API Key",
-            type="password",
-            value=_get_secret("APIFY_API_KEY"),
-            help="From https://console.apify.com/account/integrations",
-        )
+        api_key = _get_secret("APIFY_API_KEY")
+        if not api_key:
+            api_key = st.text_input(
+                "Apify API Key",
+                type="password",
+                help="Or add APIFY_API_KEY to Streamlit secrets",
+            )
+        else:
+            st.caption("✓ Apify API key loaded from secrets")
         st.divider()
         st.subheader("Search")
         custom_queries = st.text_area(
@@ -190,18 +195,16 @@ def main():
             ["OpenAI", "Anthropic"],
             help="Used for quality, pricing, and trend analysis.",
         )
-        openai_key = st.text_input(
-            "OpenAI API Key",
-            type="password",
-            value=_get_secret("OPENAI_API_KEY"),
-            help="Only if provider is OpenAI.",
-        )
-        anthropic_key = st.text_input(
-            "Anthropic API Key",
-            type="password",
-            value=_get_secret("ANTHROPIC_API_KEY"),
-            help="Only if provider is Anthropic.",
-        )
+        openai_key = _get_secret("OPENAI_API_KEY")
+        if not openai_key:
+            openai_key = st.text_input("OpenAI API Key", type="password", help="Or add OPENAI_API_KEY to secrets")
+        else:
+            st.caption("✓ OpenAI key from secrets")
+        anthropic_key = _get_secret("ANTHROPIC_API_KEY")
+        if not anthropic_key:
+            anthropic_key = st.text_input("Anthropic API Key", type="password", help="Or add ANTHROPIC_API_KEY to secrets")
+        else:
+            st.caption("✓ Anthropic key from secrets")
         max_ai_items = st.slider("Max listings to analyze with AI", 10, 50, 25)
         run_ai_clicked = st.button("Run AI analysis", use_container_width=True)
 
@@ -209,7 +212,22 @@ def main():
         st.info("Enter your **Apify API key** in the sidebar to run a scrape.")
         return
 
-    # Run scrape
+    # Load from DB on first load (fast path)
+    try:
+        engine = get_engine()
+    except Exception:
+        engine = None
+    if engine and "watch_df" not in st.session_state:
+        try:
+            cached = get_listings(engine)
+            if cached:
+                df_cached = pd.DataFrame(cached).sort_values("deal_score", ascending=False).reset_index(drop=True)
+                st.session_state["watch_df"] = df_cached
+                st.session_state["watch_items"] = cached
+        except Exception:
+            pass
+
+    # Run scrape (and save to DB)
     if run_clicked:
         queries = [q.strip() for q in custom_queries.splitlines() if q.strip()]
         if not queries:
@@ -235,16 +253,54 @@ def main():
         df = items_to_dataframe(items)
         st.session_state["watch_df"] = df
         st.session_state["watch_items"] = items
-        # Clear previous AI results when re-scraping
         if "watch_df_ai" in st.session_state:
             del st.session_state["watch_df_ai"]
+        # Persist to DB for fast load next time
+        if engine:
+            try:
+                save_listings(engine, df.to_dict("records"))
+            except Exception:
+                pass
+
+    # "Refresh data" button: re-scrape and save to DB (use 1–2x/day to save load time)
+    refresh_clicked = st.sidebar.button("Refresh data (re-scrape & save)", use_container_width=True)
+    if refresh_clicked and engine and api_key:
+        queries = [q.strip() for q in custom_queries.splitlines() if q.strip()]
+        if queries:
+            with st.spinner("Refreshing from eBay…"):
+                try:
+                    items = run_ebay_scrape(
+                        api_token=api_key,
+                        search_queries=queries,
+                        max_products_per_search=max_products,
+                        max_search_pages=max_pages,
+                        listing_type=listing_type,
+                        min_price=min_price,
+                        max_price=max_price,
+                    )
+                    if items:
+                        df_new = items_to_dataframe(items)
+                        save_listings(engine, df_new.to_dict("records"))
+                        st.session_state["watch_df"] = df_new
+                        st.session_state["watch_items"] = list(df_new.to_dict("records"))
+                        if "watch_df_ai" in st.session_state:
+                            del st.session_state["watch_df_ai"]
+                        st.success("Data refreshed and saved.")
+                    else:
+                        st.warning("No results from scrape.")
+                except Exception as e:
+                    st.error(f"Refresh failed: {e}")
+            st.rerun()
 
     if "watch_df" not in st.session_state or st.session_state["watch_df"].empty:
-        st.info("Click **Run scrape** in the sidebar to load watch listings.")
+        st.info("Click **Run scrape** in the sidebar to load watch listings, or open the app again to load from the database.")
         return
 
     df = st.session_state["watch_df"]
     items = st.session_state.get("watch_items", [])
+    if not items and not df.empty:
+        items = df.to_dict("records")
+        st.session_state["watch_items"] = items
 
     # Run AI analysis
     if run_ai_clicked:
@@ -268,6 +324,21 @@ def main():
     # Use AI dataframe if available
     df = st.session_state.get("watch_df_ai", df)
     has_ai = "ai_overall_score" in df.columns and df["ai_overall_score"].notna().any()
+
+    # Last updated (from DB)
+    if engine:
+        try:
+            last = get_last_scraped_at(engine)
+            if last:
+                from datetime import datetime
+                try:
+                    dt = datetime.fromisoformat(last.replace("Z", "+00:00"))
+                    last_str = dt.strftime("%Y-%m-%d %H:%M UTC")
+                except Exception:
+                    last_str = last[:19] if len(last) > 19 else last
+                st.caption(f"Data last refreshed: **{last_str}** — use *Refresh data* in the sidebar to update.")
+        except Exception:
+            pass
 
     # Overview metrics
     st.subheader("Overview")

@@ -27,3 +27,5 @@ Thumbs.db
 *.csv
 *.xlsx
 data/
+watches.db
+watches.db-journal
