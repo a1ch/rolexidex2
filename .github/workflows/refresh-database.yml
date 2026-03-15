@@ -1,0 +1,23 @@
+# Run twice daily to refresh Supabase without opening the Streamlit app.
+# Repo → Settings → Secrets → Actions: add APIFY_API_KEY and DATABASE_URL
+name: Refresh watch database
+
+on:
+  schedule:
+    - cron: "0 6,18 * * *"   # 06:00 and 18:00 UTC
+  workflow_dispatch:        # manual run from Actions tab
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Scrape and save to Supabase
+        env:
+          APIFY_API_KEY: ${{ secrets.APIFY_API_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: python fill_supabase.py

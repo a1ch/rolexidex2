@@ -22,7 +22,10 @@ def _sanitize(val: Any) -> Any:
 
 
 def _get_secret_db_url() -> str:
-    """Database URL from Streamlit secrets if available."""
+    """DATABASE_URL from env (CI/scripts) first, then Streamlit secrets."""
+    env_u = os.environ.get("DATABASE_URL", "").strip()
+    if env_u:
+        return env_u.replace("postgres://", "postgresql://", 1)
     try:
         import streamlit as st
         if "DATABASE_URL" in st.secrets:
@@ -31,7 +34,7 @@ def _get_secret_db_url() -> str:
                 return u.replace("postgres://", "postgresql://", 1)
     except Exception:
         pass
-    return os.environ.get("DATABASE_URL", "").strip()
+    return ""
 
 
 def get_engine():
@@ -188,3 +191,18 @@ def get_last_scraped_at(engine) -> str | None:
     with engine.connect() as conn:
         row = conn.execute(text("SELECT last_scraped_at FROM scrape_metadata WHERE id = 1")).fetchone()
     return row[0] if row else None
+
+
+def get_db_stats(engine) -> dict[str, Any]:
+    """Row count and last refresh without loading all listings."""
+    init_db(engine)
+    with engine.connect() as conn:
+        n = conn.execute(text("SELECT COUNT(*) FROM listings")).scalar_one()
+        row = conn.execute(
+            text("SELECT last_scraped_at, num_listings FROM scrape_metadata WHERE id = 1")
+        ).fetchone()
+    return {
+        "listing_count": int(n or 0),
+        "last_scraped_at": row[0] if row else None,
+        "meta_num_listings": int(row[1] or 0) if row else 0,
+    }

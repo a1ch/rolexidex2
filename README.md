@@ -12,7 +12,12 @@ A **Streamlit website** that scrapes eBay for luxury watches (via Apify), then r
   - **Trends** (1–10): seller reputation and sold count.
   - **Overall** (1–10) + short **summary**.
 - **Datasheets** — Sortable tables and expandable cards with image, prices, condition, seller, and link to eBay.
-- **Database** — Watches are stored in a DB (SQLite locally, or Postgres via `DATABASE_URL`) so the app loads fast. Use **Refresh data** in the sidebar to re-scrape and update the DB (e.g. once or twice a day).
+- **Database** — SQLite locally or Postgres/Supabase via `DATABASE_URL`. **Refresh data** in the sidebar (or **GitHub Actions** twice daily) updates the DB.
+- **Data & admin tab** — Health check (Apify, DB, AI keys), DB row counts, **CSV export**, Supabase dashboard link (`SUPABASE_PROJECT_REF` in secrets), and GitHub refresh instructions.
+- **Stale data warning** — Banner when data is older than N hours (sidebar setting, default 24h).
+- **Run AI after scrape** — Optional checkbox to run AI ranking right after scrape/refresh.
+- **`fill_supabase.py`** — CLI: `python fill_supabase.py` to scrape and save (uses env or `.streamlit/secrets.toml`).
+- **`.github/workflows/refresh-database.yml`** — Scheduled scrape to Supabase (add `APIFY_API_KEY` + `DATABASE_URL` under **Actions** secrets).
 - **Deployable** — Ready for GitHub and Streamlit Community Cloud (secrets for API keys).
 
 ## Local setup
@@ -95,7 +100,9 @@ A **Streamlit website** that scrapes eBay for luxury watches (via Apify), then r
    APIFY_API_KEY = "your_apify_token"
    OPENAI_API_KEY = "your_openai_key"
    DATABASE_URL = "postgresql://postgres.[ref]:[YOUR-PASSWORD]@aws-0-[region].pooler.supabase.com:6543/postgres"
+   SUPABASE_PROJECT_REF = "your_project_ref"
    ```
+   Optional: `SUPABASE_PROJECT_REF` adds a one-click Supabase link in **Data & admin**.
 
 4. Deploy. Your app will be available at `https://YOUR_APP_NAME.streamlit.app`.
 
@@ -116,7 +123,9 @@ A **Streamlit website** that scrapes eBay for luxury watches (via Apify), then r
 | `app.py` | Streamlit UI: load from DB, scrape/refresh, rule-based & AI tabs, datasheets |
 | `scraper.py` | Apify eBay scraper + rule-based deal scoring |
 | `ai_ranking.py` | OpenAI/Anthropic AI analysis (quality, pricing, trends) |
-| `database.py` | SQLite/Postgres persistence; `get_listings`, `save_listings`, `get_last_scraped_at` |
+| `database.py` | SQLite/Postgres; `get_listings`, `save_listings`, `get_db_stats` |
+| `fill_supabase.py` | CLI scrape → DB (for cron / manual refresh) |
+| `.github/workflows/refresh-database.yml` | Twice-daily DB refresh via Actions secrets |
 | `requirements.txt` | streamlit, apify-client, pandas, openai, anthropic, sqlalchemy, psycopg2-binary |
 | `.gitignore` | Excludes venv, secrets, watches.db, IDE/OS files |
 

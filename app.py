@@ -17,7 +17,8 @@ from ai_ranking import (
     run_ai_ranking_anthropic,
     items_to_dataframe_ai,
 )
-from database import get_engine, init_db, get_listings, save_listings, get_last_scraped_at
+from database import get_engine, init_db, get_listings, save_listings, get_last_scraped_at, get_db_stats
+from datetime import datetime, timezone, timedelta
 
 st.set_page_config(
     page_title="Luxury Watch Deals | AI Rankings",
@@ -153,6 +154,91 @@ def _render_datasheets(df: pd.DataFrame, use_ai: bool) -> None:
                 st.link_button("Open on eBay", row["url"], type="secondary")
 
 
+def _render_admin_tab(
+    engine,
+    df: pd.DataFrame,
+    has_ai: bool,
+    last_scraped: str | None,
+) -> None:
+    """Data preview, export, Supabase link, health, scheduled refresh docs."""
+    st.subheader("Data & admin")
+    st.caption("Check your database, export listings, and verify connections.")
+
+    # Health
+    st.markdown("#### Connection health")
+    h1, h2, h3, h4 = st.columns(4)
+    with h1:
+        st.write("**Apify**", "✓ configured" if _get_secret("APIFY_API_KEY") else "✗ missing")
+    with h2:
+        if not engine:
+            st.write("**Database**", "✗")
+        elif "sqlite" in str(engine.url).lower():
+            st.write("**Database**", "✓ SQLite (local)")
+        else:
+            st.write("**Database**", "✓ Postgres / Supabase")
+    with h3:
+        st.write("**OpenAI**", "✓" if _get_secret("OPENAI_API_KEY") else "—")
+    with h4:
+        st.write("**Anthropic**", "✓" if _get_secret("ANTHROPIC_API_KEY") else "—")
+
+    supabase_ref = _get_secret("SUPABASE_PROJECT_REF")
+    dash = _get_secret("SUPABASE_DASHBOARD_URL")
+    if dash:
+        st.link_button("Open Supabase dashboard", dash, type="primary")
+    elif supabase_ref:
+        st.link_button(
+            "Open Supabase dashboard",
+            f"https://supabase.com/dashboard/project/{supabase_ref}",
+            type="primary",
+        )
+    else:
+        st.info("Add **SUPABASE_PROJECT_REF** (e.g. `itaefhfsnfjmfhzctrbs`) or **SUPABASE_DASHBOARD_URL** to secrets for a one-click link to your project.")
+
+    # DB stats
+    st.markdown("#### Database snapshot")
+    if engine:
+        try:
+            stats = get_db_stats(engine)
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.metric("Rows in DB", stats["listing_count"])
+            with c2:
+                st.metric("Last saved count", stats["meta_num_listings"])
+            with c3:
+                ls = stats["last_scraped_at"] or last_scraped or "—"
+                st.metric("Last refresh (DB)", str(ls)[:19] if ls and ls != "—" else "—")
+        except Exception as e:
+            st.warning(f"Could not read DB stats: {e}")
+    else:
+        st.warning("No database engine (set DATABASE_URL for Supabase).")
+
+    # Export
+    st.markdown("#### Export current listings")
+    csv = df.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        "Download CSV",
+        csv,
+        "luxury_watch_listings.csv",
+        "text/csv",
+        use_container_width=True,
+    )
+
+    st.markdown("#### Full data preview")
+    st.dataframe(df, use_container_width=True, height=400)
+
+    st.markdown("#### Automated refresh (GitHub)")
+    st.markdown(
+        """
+        This repo includes **`.github/workflows/refresh-database.yml`**.  
+        In GitHub: **Settings → Secrets and variables → Actions**, add:
+        - `APIFY_API_KEY`
+        - `DATABASE_URL` (your Supabase URI)
+
+        The workflow runs **twice daily** (06:00 & 18:00 UTC) and can be triggered manually under **Actions**.
+        """
+    )
+
+
 def main():
     st.title("⌚ Luxury Watch Deals")
     st.caption("Scrape eBay for luxury watches (Apify), then rank by rule-based and **AI** analysis — quality, pricing, trends.")
@@ -206,7 +292,15 @@ def main():
         else:
             st.caption("✓ Anthropic key from secrets")
         max_ai_items = st.slider("Max listings to analyze with AI", 10, 50, 25)
+        run_ai_after = st.checkbox(
+            "Run AI automatically after scrape & refresh",
+            value=False,
+            help="Uses your chosen AI provider; needs API key in secrets.",
+        )
         run_ai_clicked = st.button("Run AI analysis", use_container_width=True)
+        st.divider()
+        st.caption("Data freshness")
+        stale_after_hours = st.number_input("Warn if data older than (hours)", min_value=1, max_value=168, value=24)
 
     if not api_key:
         st.info("Enter your **Apify API key** in the sidebar to run a scrape.")
@@ -261,6 +355,21 @@ def main():
                 save_listings(engine, df.to_dict("records"))
             except Exception:
                 pass
+        if run_ai_after:
+            key = openai_key if ai_provider == "OpenAI" else anthropic_key
+            if key:
+                with st.spinner("Running AI analysis…"):
+                    try:
+                        if ai_provider == "OpenAI":
+                            scored = run_ai_ranking_openai(items, key, max_items=max_ai_items)
+                        else:
+                            scored = run_ai_ranking_anthropic(items, key, max_items=max_ai_items)
+                        df_ai = items_to_dataframe_ai(scored)
+                        st.session_state["watch_df"] = df_ai
+                        st.session_state["watch_df_ai"] = df_ai
+                        st.success("AI ranking complete.")
+                    except Exception as e:
+                        st.error(f"AI failed: {e}")
 
     # "Refresh data" button: re-scrape and save to DB (use 1–2x/day to save load time)
     refresh_clicked = st.sidebar.button("Refresh data (re-scrape & save)", use_container_width=True)
@@ -286,6 +395,20 @@ def main():
                         if "watch_df_ai" in st.session_state:
                             del st.session_state["watch_df_ai"]
                         st.success("Data refreshed and saved.")
+                        if run_ai_after:
+                            key = openai_key if ai_provider == "OpenAI" else anthropic_key
+                            if key:
+                                with st.spinner("Running AI analysis…"):
+                                    try:
+                                        if ai_provider == "OpenAI":
+                                            scored = run_ai_ranking_openai(items, key, max_items=max_ai_items)
+                                        else:
+                                            scored = run_ai_ranking_anthropic(items, key, max_items=max_ai_items)
+                                        df_ai = items_to_dataframe_ai(scored)
+                                        st.session_state["watch_df"] = df_ai
+                                        st.session_state["watch_df_ai"] = df_ai
+                                    except Exception:
+                                        pass
                     else:
                         st.warning("No results from scrape.")
                 except Exception as e:
@@ -325,17 +448,28 @@ def main():
     df = st.session_state.get("watch_df_ai", df)
     has_ai = "ai_overall_score" in df.columns and df["ai_overall_score"].notna().any()
 
-    # Last updated (from DB)
+    # Last updated + stale warning
+    last_for_admin: str | None = None
     if engine:
         try:
             last = get_last_scraped_at(engine)
+            last_for_admin = last
             if last:
-                from datetime import datetime
+                last_str = last[:19] if len(last) > 19 else last
                 try:
                     dt = datetime.fromisoformat(last.replace("Z", "+00:00"))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
                     last_str = dt.strftime("%Y-%m-%d %H:%M UTC")
+                    age = datetime.now(timezone.utc) - dt
+                    if age > timedelta(hours=int(stale_after_hours)):
+                        hrs = int(age.total_seconds() // 3600)
+                        st.warning(
+                            f"Data is about **{hrs}h** old. Click **Refresh data** to update "
+                            f"(warn after **{int(stale_after_hours)}h**)."
+                        )
                 except Exception:
-                    last_str = last[:19] if len(last) > 19 else last
+                    pass
                 st.caption(f"Data last refreshed: **{last_str}** — use *Refresh data* in the sidebar to update.")
         except Exception:
             pass
@@ -355,8 +489,9 @@ def main():
         if has_ai:
             st.metric("Avg AI score", f"{df['ai_overall_score'].mean():.1f}")
 
-    # Tabs: Rule-based vs AI ranking
-    tab1, tab2, tab3 = st.tabs(["Rule-based ranking", "AI ranking", "Datasheets"])
+    tab1, tab2, tab3, tab4 = st.tabs(
+        ["Rule-based ranking", "AI ranking", "Datasheets", "Data & admin"]
+    )
     with tab1:
         _render_rule_based(st.session_state["watch_df"])
     with tab2:
@@ -368,9 +503,11 @@ def main():
             _render_datasheets(df, use_ai=True)
         else:
             _render_datasheets(st.session_state["watch_df"], use_ai=False)
+    with tab4:
+        _render_admin_tab(engine, df, has_ai, last_for_admin)
 
     st.divider()
-    st.caption("Data from eBay via Apify. AI analysis uses OpenAI or Anthropic. Deploy to GitHub and Streamlit Community Cloud — see README.")
+    st.caption("Data from eBay via Apify. AI uses OpenAI or Anthropic. DB refresh: sidebar or GitHub Actions — see **Data & admin** tab.")
 
 
 if __name__ == "__main__":
