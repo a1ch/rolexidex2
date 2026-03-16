@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
-One-shot: scrape eBay (Apify) and save listings to your database (Supabase/Postgres or SQLite).
+One-shot: scrape eBay and save listings to your database (Supabase/Postgres or SQLite).
 
-Usage:
-  Set APIFY_API_KEY and DATABASE_URL (env or .streamlit/secrets.toml), then:
-    python fill_supabase.py
+Data source (one of):
+  - Apify: set APIFY_API_KEY
+  - eBay API: set EBAY_CLIENT_ID and EBAY_CLIENT_SECRET
+
+Required: DATABASE_URL (env or .streamlit/secrets.toml).
 
 Optional env:
-  SEARCH_QUERIES="Rolex\nOmega"  (newline-separated, or use defaults)
-  MAX_PRODUCTS=50 MAX_PAGES=3
+  SEARCH_QUERIES="Rolex\\nOmega"  (newline-separated, or use defaults)
+  MAX_PRODUCTS=50  (MAX_PAGES only used for Apify)
 """
 from __future__ import annotations
 
@@ -35,9 +37,18 @@ def _load_local_secrets() -> None:
 def main() -> int:
     _load_local_secrets()
     api = os.environ.get("APIFY_API_KEY", "").strip()
+    ebay_id = os.environ.get("EBAY_CLIENT_ID", "").strip()
+    ebay_secret = os.environ.get("EBAY_CLIENT_SECRET", "").strip()
     db = os.environ.get("DATABASE_URL", "").strip()
-    if not api:
-        print("Missing APIFY_API_KEY (env or .streamlit/secrets.toml)", file=sys.stderr)
+
+    use_apify = bool(api)
+    use_ebay_api = bool(ebay_id and ebay_secret)
+
+    if not use_apify and not use_ebay_api:
+        print(
+            "Missing credentials: set APIFY_API_KEY (Apify) or EBAY_CLIENT_ID + EBAY_CLIENT_SECRET (eBay API) in env or .streamlit/secrets.toml",
+            file=sys.stderr,
+        )
         return 1
     if not db:
         print("Missing DATABASE_URL for Postgres/Supabase (env or secrets.toml)", file=sys.stderr)
@@ -54,14 +65,26 @@ def main() -> int:
     max_p = int(os.environ.get("MAX_PRODUCTS", "50"))
     max_pages = int(os.environ.get("MAX_PAGES", "3"))
 
-    print("Scraping eBay…", qlist)
-    items = run_ebay_scrape(
-        api_token=api,
-        search_queries=qlist,
-        max_products_per_search=max_p,
-        max_search_pages=max_pages,
-        listing_type="all",
-    )
+    if use_apify:
+        print("Scraping eBay via Apify…", qlist)
+        items = run_ebay_scrape(
+            api_token=api,
+            search_queries=qlist,
+            max_products_per_search=max_p,
+            max_search_pages=max_pages,
+            listing_type="all",
+        )
+    else:
+        from ebay_api import run_ebay_api_search
+        print("Fetching from eBay API…", qlist)
+        items = run_ebay_api_search(
+            client_id=ebay_id,
+            client_secret=ebay_secret,
+            search_queries=qlist,
+            limit_per_query=min(max_p, 200),
+            max_total=max_p * len(qlist),
+        )
+
     if not items:
         print("No items returned.", file=sys.stderr)
         return 2

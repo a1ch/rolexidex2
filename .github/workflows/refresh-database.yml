@@ -1,5 +1,6 @@
 # Run twice daily to refresh Supabase without opening the Streamlit app.
-# Repo → Settings → Secrets → Actions: add APIFY_API_KEY and DATABASE_URL
+# Repo → Settings → Secrets → Actions: add DATABASE_URL and either:
+#   APIFY_API_KEY  OR  EBAY_CLIENT_ID + EBAY_CLIENT_SECRET
 name: Refresh watch database
 
 on:
@@ -20,17 +21,26 @@ jobs:
         id: check
         env:
           APIFY_API_KEY: ${{ secrets.APIFY_API_KEY }}
+          EBAY_CLIENT_ID: ${{ secrets.EBAY_CLIENT_ID }}
+          EBAY_CLIENT_SECRET: ${{ secrets.EBAY_CLIENT_SECRET }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: |
-          if [ -n "$APIFY_API_KEY" ] && [ -n "$DATABASE_URL" ]; then
+          if [ -z "$DATABASE_URL" ]; then
+            echo "have_secrets=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipped: Add DATABASE_URL in Settings → Secrets and variables → Actions."
+            exit 0
+          fi
+          if [ -n "$APIFY_API_KEY" ] || { [ -n "$EBAY_CLIENT_ID" ] && [ -n "$EBAY_CLIENT_SECRET" ]; }; then
             echo "have_secrets=true" >> "$GITHUB_OUTPUT"
           else
             echo "have_secrets=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::Skipped refresh: Add APIFY_API_KEY and DATABASE_URL in repo Settings → Secrets and variables → Actions to run the scrape."
+            echo "::notice::Skipped: Add APIFY_API_KEY or (EBAY_CLIENT_ID + EBAY_CLIENT_SECRET) and DATABASE_URL in Settings → Secrets and variables → Actions."
           fi
       - name: Scrape and save to Supabase
         if: steps.check.outputs.have_secrets == 'true'
         env:
           APIFY_API_KEY: ${{ secrets.APIFY_API_KEY }}
+          EBAY_CLIENT_ID: ${{ secrets.EBAY_CLIENT_ID }}
+          EBAY_CLIENT_SECRET: ${{ secrets.EBAY_CLIENT_SECRET }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         run: python fill_supabase.py
