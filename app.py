@@ -370,12 +370,15 @@ def main():
         st.info("Enter your **eBay Client ID** and **Client Secret** in the sidebar (from eBay Developer Program → Application Keys).")
         return
 
-    # Load from DB on first load (fast path)
+    # Preload last scrape from DB when we have no data (first load or empty session)
     try:
         engine = get_engine()
     except Exception:
         engine = None
-    if engine and "watch_df" not in st.session_state:
+    need_data = "watch_df" not in st.session_state or st.session_state.get("watch_df") is None or (
+        isinstance(st.session_state.get("watch_df"), pd.DataFrame) and st.session_state["watch_df"].empty
+    )
+    if engine and need_data:
         try:
             cached = get_listings(engine)
             if cached:
@@ -449,6 +452,24 @@ def main():
                     except Exception as e:
                         st.error("AI failed: " + _ai_error_message(e))
 
+    # "Load last scrape" from DB (no new scrape — use after scheduled refresh or to restore view)
+    load_db_clicked = st.sidebar.button("Load last scrape from DB", use_container_width=True) if engine else False
+    if load_db_clicked and engine:
+        try:
+            cached = get_listings(engine)
+            if cached:
+                df_cached = pd.DataFrame(cached).sort_values("deal_score", ascending=False).reset_index(drop=True)
+                st.session_state["watch_df"] = df_cached
+                st.session_state["watch_items"] = cached
+                if "watch_df_ai" in st.session_state:
+                    del st.session_state["watch_df_ai"]
+                st.sidebar.success(f"Loaded {len(cached)} listings from database.")
+            else:
+                st.sidebar.warning("Database is empty. Run a scrape first.")
+        except Exception as e:
+            st.sidebar.error(f"Could not load from DB: {e}")
+        st.rerun()
+
     # "Refresh data" button: re-scrape and save to DB (use 1–2x/day to save load time)
     refresh_clicked = st.sidebar.button("Refresh data (re-scrape & save)", use_container_width=True)
     has_refresh_creds = (api_key and not use_ebay_api) or (use_ebay_api and ebay_client_id and ebay_client_secret)
@@ -504,7 +525,10 @@ def main():
             st.rerun()
 
     if "watch_df" not in st.session_state or st.session_state["watch_df"].empty:
-        st.info("Click **Run scrape** in the sidebar to load watch listings, or open the app again to load from the database.")
+        st.info(
+            "No listings loaded. Use **Load last scrape from DB** in the sidebar to load the last saved data, "
+            "or **Run scrape** to fetch fresh listings. The app also preloads from the database when you open it."
+        )
         return
 
     df = st.session_state["watch_df"]

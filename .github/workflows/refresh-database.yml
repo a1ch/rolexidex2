@@ -16,7 +16,20 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install -r requirements.txt
+      - name: Check required secrets
+        id: check
+        env:
+          APIFY_API_KEY: ${{ secrets.APIFY_API_KEY }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          if [ -n "$APIFY_API_KEY" ] && [ -n "$DATABASE_URL" ]; then
+            echo "have_secrets=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_secrets=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::Skipped refresh: Add APIFY_API_KEY and DATABASE_URL in repo Settings → Secrets and variables → Actions to run the scrape."
+          fi
       - name: Scrape and save to Supabase
+        if: steps.check.outputs.have_secrets == 'true'
         env:
           APIFY_API_KEY: ${{ secrets.APIFY_API_KEY }}
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
