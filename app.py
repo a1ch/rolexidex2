@@ -12,6 +12,7 @@ from scraper import (
     items_to_dataframe,
     DEFAULT_WATCH_QUERIES,
 )
+from ebay_api import run_ebay_api_search
 from ai_ranking import (
     run_ai_ranking_openai,
     run_ai_ranking_anthropic,
@@ -185,7 +186,7 @@ def _render_datasheets(df: pd.DataFrame, use_ai: bool) -> None:
                 level = row.get("fake_risk_level", "")
                 if pd.notna(risk):
                     color = "red" if level == "high" else "orange" if level == "medium" else "green"
-                    st.markdown(f"**Fake risk:** :{color}[{risk:.0f} — {level}]")
+                    st.markdown(f"**Likelihood of fake:** :{color}[{risk:.0f}% — {level}]")
                     reasons = row.get("fake_reasons") or []
                     if reasons:
                         for r in reasons[:3]:
@@ -220,6 +221,8 @@ def _render_admin_tab(
         st.write("**OpenAI**", "✓" if _get_secret("OPENAI_API_KEY") else "—")
     with h4:
         st.write("**Anthropic**", "✓" if _get_secret("ANTHROPIC_API_KEY") else "—")
+    st.caption("**Data source:** Apify ✓" if _get_secret("APIFY_API_KEY") else "**Data source:** Apify —")
+    st.caption("**eBay API** (Client ID + Secret): ✓" if (_get_secret("EBAY_CLIENT_ID") and _get_secret("EBAY_CLIENT_SECRET")) else "**eBay API**: —")
 
     supabase_ref = _get_secret("SUPABASE_PROJECT_REF")
     dash = _get_secret("SUPABASE_DASHBOARD_URL")
@@ -281,11 +284,16 @@ def _render_admin_tab(
 
 def main():
     st.title("⌚ Luxury Watch Deals")
-    st.caption("Scrape eBay for luxury watches (Apify), then rank by rule-based and **AI** analysis — quality, pricing, trends.")
+    st.caption("Luxury watch listings from **Apify** or **eBay API** — rank by rule-based and **AI** analysis.")
 
     # Sidebar
     with st.sidebar:
         st.header("Settings")
+        data_source = st.radio(
+            "Data source",
+            ["Apify (scraper)", "eBay API (your keys)"],
+            help="eBay API uses your eBay Developer keys (Browse API).",
+        )
         api_key = _get_secret("APIFY_API_KEY")
         if not api_key:
             api_key = st.text_input(
@@ -295,6 +303,18 @@ def main():
             )
         else:
             st.caption("✓ Apify API key loaded from secrets")
+
+        ebay_client_id = _get_secret("EBAY_CLIENT_ID")
+        ebay_client_secret = _get_secret("EBAY_CLIENT_SECRET")
+        if not ebay_client_id:
+            ebay_client_id = st.text_input("eBay Client ID (App ID)", type="password", help="From eBay Developer Program")
+        else:
+            st.caption("✓ eBay Client ID from secrets")
+        if not ebay_client_secret:
+            ebay_client_secret = st.text_input("eBay Client Secret (Cert ID)", type="password", help="From eBay Developer Program")
+        else:
+            st.caption("✓ eBay Client Secret from secrets")
+
         st.divider()
         st.subheader("Search")
         custom_queries = st.text_area(
@@ -342,8 +362,12 @@ def main():
         st.caption("Data freshness")
         stale_after_hours = st.number_input("Warn if data older than (hours)", min_value=1, max_value=168, value=24)
 
-    if not api_key:
-        st.info("Enter your **Apify API key** in the sidebar to run a scrape.")
+    use_ebay_api = data_source == "eBay API (your keys)"
+    if not use_ebay_api and not api_key:
+        st.info("Enter your **Apify API key** in the sidebar to run a scrape, or switch to **eBay API** and add your eBay keys.")
+        return
+    if use_ebay_api and (not ebay_client_id or not ebay_client_secret):
+        st.info("Enter your **eBay Client ID** and **Client Secret** in the sidebar (from eBay Developer Program → Application Keys).")
         return
 
     # Load from DB on first load (fast path)
@@ -367,20 +391,34 @@ def main():
         if not queries:
             st.error("Add at least one search query.")
             return
-        with st.spinner("Scraping eBay via Apify…"):
-            try:
-                items = run_ebay_scrape(
-                    api_token=api_key,
-                    search_queries=queries,
-                    max_products_per_search=max_products,
-                    max_search_pages=max_pages,
-                    listing_type=listing_type,
-                    min_price=min_price,
-                    max_price=max_price,
-                )
-            except Exception as e:
-                st.error(f"Scrape failed: {e}")
-                return
+        if use_ebay_api:
+            with st.spinner("Fetching from eBay API…"):
+                try:
+                    items = run_ebay_api_search(
+                        client_id=ebay_client_id,
+                        client_secret=ebay_client_secret,
+                        search_queries=queries,
+                        limit_per_query=min(max_products, 200),
+                        max_total=max_products * len(queries),
+                    )
+                except Exception as e:
+                    st.error(f"eBay API failed: {e}")
+                    return
+        else:
+            with st.spinner("Scraping eBay via Apify…"):
+                try:
+                    items = run_ebay_scrape(
+                        api_token=api_key,
+                        search_queries=queries,
+                        max_products_per_search=max_products,
+                        max_search_pages=max_pages,
+                        listing_type=listing_type,
+                        min_price=min_price,
+                        max_price=max_price,
+                    )
+                except Exception as e:
+                    st.error(f"Scrape failed: {e}")
+                    return
         if not items:
             st.warning("No results. Try different queries or filters.")
             return
@@ -413,20 +451,30 @@ def main():
 
     # "Refresh data" button: re-scrape and save to DB (use 1–2x/day to save load time)
     refresh_clicked = st.sidebar.button("Refresh data (re-scrape & save)", use_container_width=True)
-    if refresh_clicked and engine and api_key:
+    has_refresh_creds = (api_key and not use_ebay_api) or (use_ebay_api and ebay_client_id and ebay_client_secret)
+    if refresh_clicked and engine and has_refresh_creds:
         queries = [q.strip() for q in custom_queries.splitlines() if q.strip()]
         if queries:
             with st.spinner("Refreshing from eBay…"):
                 try:
-                    items = run_ebay_scrape(
-                        api_token=api_key,
-                        search_queries=queries,
-                        max_products_per_search=max_products,
-                        max_search_pages=max_pages,
-                        listing_type=listing_type,
-                        min_price=min_price,
-                        max_price=max_price,
-                    )
+                    if use_ebay_api:
+                        items = run_ebay_api_search(
+                            client_id=ebay_client_id,
+                            client_secret=ebay_client_secret,
+                            search_queries=queries,
+                            limit_per_query=min(max_products, 200),
+                            max_total=max_products * len(queries),
+                        )
+                    else:
+                        items = run_ebay_scrape(
+                            api_token=api_key,
+                            search_queries=queries,
+                            max_products_per_search=max_products,
+                            max_search_pages=max_pages,
+                            listing_type=listing_type,
+                            min_price=min_price,
+                            max_price=max_price,
+                        )
                     if items:
                         df_new = items_to_dataframe(items)
                         save_listings(engine, df_new.to_dict("records"))
@@ -542,6 +590,43 @@ def main():
             st.metric("Avg AI score", f"{df['ai_overall_score'].mean():.1f}")
     with c6:
         st.metric("High fake risk", high_risk)
+
+    # Likelihood-of-fake calculator
+    with st.expander("Likelihood of fake calculator", expanded=False):
+        st.caption("Enter listing details to get a rule-based fake/replica likelihood (0–100%). Same logic as table risk scores.")
+        calc_title = st.text_input("Listing title", placeholder="e.g. Rolex Submariner Date 41mm...", key="calc_title")
+        calc_col1, calc_col2 = st.columns(2)
+        with calc_col1:
+            calc_price = st.number_input("Price (optional)", min_value=0.0, value=0.0, step=100.0, key="calc_price",
+                help="Leave 0 to skip price-based checks.")
+            calc_fb_pct = st.number_input("Seller feedback % (optional)", min_value=0.0, max_value=100.0, value=0.0, step=1.0, key="calc_fb_pct")
+        with calc_col2:
+            calc_fb_count = st.number_input("Seller feedback count (optional)", min_value=0, value=0, step=10, key="calc_fb_count")
+        if st.button("Calculate likelihood of fake", key="calc_btn"):
+            if not (calc_title or "").strip():
+                st.warning("Enter at least a title.")
+            else:
+                from fake_detection import compute_fake_risk
+                item = {"title": (calc_title or "").strip()}
+                if calc_price and calc_price > 0:
+                    item["price_value"] = calc_price
+                    item["price"] = calc_price
+                if calc_fb_pct and calc_fb_pct > 0:
+                    item["sellerFeedbackPercent"] = str(calc_fb_pct)
+                if calc_fb_count and calc_fb_count > 0:
+                    item["sellerFeedbackCount"] = str(calc_fb_count)
+                risk = compute_fake_risk(item)
+                score = risk["fake_risk_score"]
+                level = risk["fake_risk_level"]
+                reasons = risk.get("fake_reasons") or []
+                st.metric("Likelihood of fake", f"{score:.0f}%")
+                st.write("**Risk level:**", level)
+                if reasons:
+                    st.write("**Reasons:**")
+                    for r in reasons:
+                        st.caption(f"• {r}")
+                if not reasons:
+                    st.caption("No red flags from title, price, or seller.")
 
     tab1, tab2, tab3, tab4 = st.tabs(
         ["Rule-based ranking", "AI ranking", "Datasheets", "Data & admin"]
