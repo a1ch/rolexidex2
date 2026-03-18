@@ -37,6 +37,11 @@ def _get_secret_db_url() -> str:
     return ""
 
 
+def is_remote_database_configured() -> bool:
+    """True if DATABASE_URL is set (e.g. Supabase). Lets the app load saved data without scrape keys."""
+    return bool(_get_secret_db_url().strip())
+
+
 def get_engine():
     url = _get_secret_db_url() or "sqlite:///watches.db"
     if "sqlite" in url:

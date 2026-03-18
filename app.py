@@ -18,7 +18,15 @@ from ai_ranking import (
     run_ai_ranking_anthropic,
     items_to_dataframe_ai,
 )
-from database import get_engine, init_db, get_listings, save_listings, get_last_scraped_at, get_db_stats
+from database import (
+    get_engine,
+    init_db,
+    get_listings,
+    save_listings,
+    get_last_scraped_at,
+    get_db_stats,
+    is_remote_database_configured,
+)
 from datetime import datetime, timezone, timedelta
 
 st.set_page_config(
@@ -316,10 +324,60 @@ def main():
             st.caption("✓ eBay Client Secret from secrets")
 
         st.divider()
+        st.subheader("eBay API config")
+        ebay_marketplace_id = _get_secret("EBAY_MARKETPLACE_ID")
+        if not ebay_marketplace_id:
+            ebay_marketplace_id = st.text_input(
+                "eBay Marketplace ID",
+                value="EBAY_US",
+                help="Sent as `X-EBAY-C-MARKETPLACE-ID` (e.g. EBAY_US, EBAY_GB).",
+            )
+        else:
+            st.caption(f"✓ Marketplace ID from secrets: `{ebay_marketplace_id}`")
+        os.environ["EBAY_MARKETPLACE_ID"] = str(ebay_marketplace_id).strip() or "EBAY_US"
+
+        ebay_use_sandbox_secret = _get_secret("EBAY_USE_SANDBOX").lower()
+        ebay_use_sandbox_default = ebay_use_sandbox_secret in {"1", "true", "yes", "y"}
+        ebay_use_sandbox = st.checkbox(
+            "Use eBay sandbox endpoints",
+            value=ebay_use_sandbox_default,
+            help="Enable if your keys are sandbox keys (so we call api.sandbox.ebay.com).",
+        )
+        if ebay_use_sandbox:
+            os.environ["EBAY_USE_SANDBOX"] = "true"
+        else:
+            os.environ.pop("EBAY_USE_SANDBOX", None)
+
         st.subheader("Search")
         custom_queries = st.text_area(
             "Search queries (one per line)",
             value="\n".join(DEFAULT_WATCH_QUERIES),
+            height=120,
+        )
+        st.divider()
+        st.subheader("Brand filter")
+        brand_filter_enabled = st.checkbox(
+            "Only show high-end brand watches (title must match)",
+            value=True,
+            help="Filters results after scraping/loading by requiring the listing title to contain at least one brand keyword.",
+        )
+        default_brand_keywords = [
+            "rolex",
+            "omega",
+            "tag heuer",
+            "breitling",
+            "cartier",
+            "patek philippe",
+            "audemars",
+            "iwc",
+            "vacheron",
+            "panerai",
+            "glashutte",
+            "richard mille",
+        ]
+        brand_keywords_text = st.text_area(
+            "Brand keywords (one per line)",
+            value="\n".join(default_brand_keywords),
             height=120,
         )
         max_products = st.slider("Max products per query", 10, 3000, 500)
@@ -332,7 +390,15 @@ def main():
             max_price = st.number_input("Max price (USD)", min_value=0, value=0, step=500)
         min_price = min_price or None
         max_price = max_price or None
-        run_clicked = st.button("Run scrape", type="primary", use_container_width=True)
+        run_clicked = st.button(
+            "Start scanning",
+            type="primary",
+            use_container_width=True,
+            disabled=not (
+                (data_source == "eBay API (your keys)" and ebay_client_id and ebay_client_secret)
+                or (data_source == "Apify (scraper)" and api_key)
+            ),
+        )
 
         st.divider()
         st.subheader("AI ranking")
@@ -363,12 +429,39 @@ def main():
         stale_after_hours = st.number_input("Warn if data older than (hours)", min_value=1, max_value=168, value=24)
 
     use_ebay_api = data_source == "eBay API (your keys)"
-    if not use_ebay_api and not api_key:
-        st.info("Enter your **Apify API key** in the sidebar to run a scrape, or switch to **eBay API** and add your eBay keys.")
+    can_scan = (use_ebay_api and bool(ebay_client_id and ebay_client_secret)) or (
+        not use_ebay_api and bool(api_key)
+    )
+    has_cloud_db = is_remote_database_configured()
+
+    if not can_scan and not has_cloud_db:
+        st.info(
+            "**No data source yet.** Add **`DATABASE_URL`** in Streamlit secrets to load listings saved by the scheduled job, "
+            "or add an **Apify** key / **eBay API** keys in the sidebar to scan eBay."
+        )
         return
-    if use_ebay_api and (not ebay_client_id or not ebay_client_secret):
-        st.info("Enter your **eBay Client ID** and **Client Secret** in the sidebar (from eBay Developer Program → Application Keys).")
-        return
+    if not can_scan and has_cloud_db:
+        st.success(
+            "Loading from your **database** (DATABASE_URL). Add Apify or eBay keys in the sidebar if you want to run a new scan from this app."
+        )
+
+    # Main-area button (same as sidebar "Run scrape")
+    scan_row1, scan_row2 = st.columns([1, 2])
+    with scan_row1:
+        main_start_scan = st.button(
+            "▶ Start scanning",
+            type="primary",
+            use_container_width=True,
+            disabled=not can_scan,
+            help="Requires Apify or eBay API keys in the sidebar."
+            if not can_scan
+            else "Fetch listings using the search queries and limits in the sidebar.",
+        )
+    with scan_row2:
+        st.caption("Uses **Data source**, queries, and max products from the sidebar → Settings.")
+    run_clicked = run_clicked or main_start_scan
+    if st.session_state.pop("_trigger_scrape_next", False):
+        run_clicked = True
 
     # Preload last scrape from DB when we have no data (first load or empty session)
     try:
@@ -378,6 +471,7 @@ def main():
     need_data = "watch_df" not in st.session_state or st.session_state.get("watch_df") is None or (
         isinstance(st.session_state.get("watch_df"), pd.DataFrame) and st.session_state["watch_df"].empty
     )
+    preload_error: str | None = None
     if engine and need_data:
         try:
             cached = get_listings(engine)
@@ -385,11 +479,18 @@ def main():
                 df_cached = pd.DataFrame(cached).sort_values("deal_score", ascending=False).reset_index(drop=True)
                 st.session_state["watch_df"] = df_cached
                 st.session_state["watch_items"] = cached
-        except Exception:
-            pass
+        except Exception as e:
+            preload_error = str(e)
+
+    if preload_error and need_data:
+        st.error(f"**Could not load from database:** {preload_error}")
+        st.caption("Check **DATABASE_URL** in secrets (use `postgresql://` for Supabase) and that the DB is reachable.")
 
     # Run scrape (and save to DB)
     if run_clicked:
+        if not can_scan:
+            st.error("Add **Apify** or **eBay API** keys in the sidebar to scan.")
+            st.stop()
         queries = [q.strip() for q in custom_queries.splitlines() if q.strip()]
         if not queries:
             st.error("Add at least one search query.")
@@ -525,13 +626,44 @@ def main():
             st.rerun()
 
     if "watch_df" not in st.session_state or st.session_state["watch_df"].empty:
+        db_hint = ""
+        if engine:
+            try:
+                stats = get_db_stats(engine)
+                n = stats["listing_count"]
+                db_hint = f" Your database currently has **{n}** listing(s)."
+                if n == 0:
+                    db_hint += (
+                        " Run the **Refresh watch database** GitHub Action (with API keys + DATABASE_URL) "
+                        "or scan from this app once you add keys."
+                    )
+            except Exception:
+                pass
         st.info(
-            "No listings loaded. Use **Load last scrape from DB** in the sidebar to load the last saved data, "
-            "or **Run scrape** to fetch fresh listings. The app also preloads from the database when you open it."
+            "No listings in this session yet."
+            + db_hint
+            + " Click **▶ Start scanning** (needs API keys), or **Load last scrape from DB** in the sidebar."
         )
+        if can_scan and st.button("▶ Start scanning", type="primary", key="start_scan_empty_state"):
+            st.session_state["_trigger_scrape_next"] = True
+            st.rerun()
+        elif not can_scan and has_cloud_db:
+            st.caption("You can only load from DB right now — use **Load last scrape from DB** in the sidebar.")
         return
 
     df = st.session_state["watch_df"]
+    # Optional post-filter: require title to match at least one brand keyword.
+    if brand_filter_enabled:
+        brand_keywords = [x.strip().lower() for x in brand_keywords_text.splitlines() if x.strip()]
+        if brand_keywords and "title" in df.columns and not df.empty:
+            def _title_matches_any_brand(t: object) -> bool:
+                tl = str(t or "").lower()
+                return any(k in tl for k in brand_keywords)
+
+            mask = df["title"].apply(_title_matches_any_brand)
+            df = df.loc[mask].reset_index(drop=True)
+            st.session_state["watch_df"] = df
+            st.session_state["watch_items"] = df.to_dict("records")
     items = st.session_state.get("watch_items", [])
     if not items and not df.empty:
         items = df.to_dict("records")
