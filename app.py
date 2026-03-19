@@ -158,12 +158,18 @@ def _render_datasheets(df: pd.DataFrame, use_ai: bool) -> None:
     for i in range(n_cards):
         row = df.iloc[i]
         title_short = (row.get("title") or "")[:70]
+        price_short = str(row.get("priceString") or "").strip()
         if use_ai and "ai_overall_score" in row and pd.notna(row.get("ai_overall_score")):
-            label = f"#{i+1} — {title_short}… | AI: {row['ai_overall_score']:.1f}"
+            label = f"#{i+1} — {title_short}… | AI: {row['ai_overall_score']:.1f}" + (f" | {price_short}" if price_short else "")
         else:
-            label = f"#{i+1} — {title_short}… | Score: {row['deal_score']}"
+            label = f"#{i+1} — {title_short}… | Score: {row['deal_score']}" + (f" | {price_short}" if price_short else "")
         with st.expander(label):
             url = row.get("url") or ""
+            # Fallback: construct a usable eBay link when the dataset doesn't include `url`.
+            if not url:
+                item_id = row.get("itemId") or ""
+                if item_id:
+                    url = f"https://www.ebay.com/itm/{item_id}"
             title_full = (row.get("title") or "").strip()
             if url and title_full:
                 st.markdown(f"[**{title_full}**]({url})")
