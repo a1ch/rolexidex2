@@ -4,6 +4,7 @@ Scrape eBay via Apify, rank by rule-based and AI analysis (quality, pricing, tre
 Deploy to GitHub + Streamlit Community Cloud.
 """
 import os
+import re
 import streamlit as st
 import pandas as pd
 
@@ -199,6 +200,36 @@ def _render_datasheets(df: pd.DataFrame, use_ai: bool) -> None:
                     if reasons:
                         for r in reasons[:3]:
                             st.caption(f"• {r}")
+
+                # Lightweight "history" + "when made" hints derived from the listing title.
+                # (We can't know real production year/history without papers/serial/model data.)
+                title_lc = (title_full or "").lower()
+                year_m = re.search(r"(19\d{2}|20\d{2})", title_lc)
+                made_year = year_m.group(1) if year_m else None
+                if made_year:
+                    st.caption(f"• Watch made (claimed): {made_year}")
+
+                history_flags: list[str] = []
+                if "no papers" in title_lc:
+                    history_flags.append("No papers (verify authenticity)")
+                elif "papers" in title_lc:
+                    history_flags.append("Includes papers (claimed)")
+
+                if "no box" in title_lc:
+                    history_flags.append("No box (verify completeness)")
+                elif "box" in title_lc:
+                    history_flags.append("Includes box (claimed)")
+
+                if "serviced" in title_lc or "service" in title_lc:
+                    history_flags.append("Service/serviced mentioned")
+
+                if "warranty" in title_lc:
+                    history_flags.append("Warranty mentioned")
+
+                if history_flags:
+                    st.caption("**History/features:**")
+                    for flag in history_flags[:5]:
+                        st.caption(f"• {flag}")
             if row.get("url"):
                 st.link_button("Open on eBay", row["url"], type="secondary")
 
