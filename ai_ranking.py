@@ -19,8 +19,7 @@ try:
 except ImportError:
     Anthropic = None
 
-# Anthropic model IDs change over time; `claude-3-5-haiku-20241022` may 404 on newer accounts.
-ANTHROPIC_MODEL_DEFAULT = "claude-haiku-4-5-20251001"
+# Anthropic: if the primary model 404s, try fallbacks (IDs change over time).
 ANTHROPIC_MODEL_FALLBACKS = (
     "claude-haiku-4-5",
     "claude-3-5-sonnet-20241022",
@@ -134,7 +133,7 @@ def run_ai_ranking_openai(
 def run_ai_ranking_anthropic(
     items: list[dict[str, Any]],
     api_key: str,
-    model: str = ANTHROPIC_MODEL_DEFAULT,
+    model: str = "claude-haiku-4-5-20251001",
     max_items: int = 30,
 ) -> list[dict[str, Any]]:
     """Run AI ranking using Anthropic. Returns items with added ai_* fields."""
