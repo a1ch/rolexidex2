@@ -19,6 +19,13 @@ try:
 except ImportError:
     Anthropic = None
 
+# Anthropic model IDs change over time; `claude-3-5-haiku-20241022` may 404 on newer accounts.
+ANTHROPIC_MODEL_DEFAULT = "claude-haiku-4-5-20251001"
+ANTHROPIC_MODEL_FALLBACKS = (
+    "claude-haiku-4-5",
+    "claude-3-5-sonnet-20241022",
+)
+
 
 def _get_openai_client(api_key: str) -> OpenAI | None:
     if OpenAI is None:
@@ -127,7 +134,7 @@ def run_ai_ranking_openai(
 def run_ai_ranking_anthropic(
     items: list[dict[str, Any]],
     api_key: str,
-    model: str = "claude-3-5-haiku-20241022",
+    model: str = ANTHROPIC_MODEL_DEFAULT,
     max_items: int = 30,
 ) -> list[dict[str, Any]]:
     """Run AI ranking using Anthropic. Returns items with added ai_* fields."""
@@ -179,12 +186,29 @@ Example: [{{"quality_score": 7, "pricing_score": 8, "trend_score": 6, "overall_a
         text = resp.choices[0].message.content or ""
     else:
         client = Anthropic(api_key=api_key)
-        msg = client.messages.create(
-            model=model,
-            max_tokens=2048,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        text = (msg.content[0].text if msg.content else "") or ""
+        models_to_try: list[str] = []
+        for m in (model, *ANTHROPIC_MODEL_FALLBACKS):
+            if m and m not in models_to_try:
+                models_to_try.append(m)
+        text = ""
+        last_err: Exception | None = None
+        for m in models_to_try:
+            try:
+                msg = client.messages.create(
+                    model=m,
+                    max_tokens=2048,
+                    messages=[{"role": "user", "content": prompt}],
+                )
+                text = (msg.content[0].text if msg.content else "") or ""
+                break
+            except Exception as e:
+                err = str(e).lower()
+                if "404" in str(e) or "not_found" in err:
+                    last_err = e
+                    continue
+                raise
+        if not text and last_err:
+            raise last_err
 
     parsed = _parse_ai_response(text, len(subset))
     if len(parsed) != len(subset):
