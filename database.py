@@ -8,11 +8,11 @@ from __future__ import annotations
 import math
 import os
 import socket
+import urllib.parse
 from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import create_engine, text
-from sqlalchemy.engine import make_url
 
 
 def _sanitize(val: Any) -> Any:
@@ -57,14 +57,34 @@ def get_engine():
 
         # Streamlit Cloud sometimes ends up trying IPv6 routes for Supabase hosts.
         # If IPv6 isn't reachable, you may see: "Cannot assign requested address".
-        # We try to force IPv4 by resolving the hostname via AF_INET.
+        # Force IPv4 resolution and also pass `hostaddr` to libpq when possible.
         try:
-            u = make_url(url)
-            if u.host and "supabase.co" in u.host:
-                ipv4_addrs = socket.getaddrinfo(u.host, None, socket.AF_INET)
+            parsed = urllib.parse.urlsplit(url)
+            host = parsed.hostname
+            if host and "supabase.co" in host.lower():
+                ipv4_addrs = socket.getaddrinfo(host, None, socket.AF_INET)
                 if ipv4_addrs:
                     ipv4 = ipv4_addrs[0][4][0]
-                    url = str(u.set(host=ipv4))
+
+                    # 1) Prefer passing hostaddr to avoid DNS issues.
+                    connect_args = kwargs.get("connect_args") or {}
+                    connect_args["hostaddr"] = ipv4
+                    kwargs["connect_args"] = connect_args
+
+                    # 2) Also rewrite URL host to IPv4 (extra safety).
+                    # Rebuild netloc while preserving username/password and port.
+                    userinfo = ""
+                    if parsed.username is not None:
+                        userinfo = parsed.username
+                        if parsed.password is not None:
+                            userinfo += ":" + parsed.password
+                        userinfo += "@"
+
+                    port = f":{parsed.port}" if parsed.port else ""
+                    new_netloc = f"{userinfo}{ipv4}{port}"
+                    url = urllib.parse.urlunsplit(
+                        (parsed.scheme, new_netloc, parsed.path, parsed.query, parsed.fragment)
+                    )
         except Exception:
             pass
     return create_engine(url, **kwargs)
