@@ -83,10 +83,26 @@ def _item_summary_to_listing(s: dict[str, Any]) -> dict[str, Any]:
             value = float(value)
         except (TypeError, ValueError):
             value = None
-    # List price / original price (seller discount)
-    listing_price = s.get("unitPrice", {}) or {}
-    list_value = listing_price.get("value")
-    list_price_string = f"{listing_price.get('currency', 'USD')} {list_value}" if list_value else ""
+    # Seller
+    seller_obj = s.get("seller", {}) or {}
+    seller_name = seller_obj.get("username", "") or ""
+    feedback_pct = seller_obj.get("feedbackPercentage")
+    seller_feedback_percent = str(feedback_pct) if feedback_pct is not None else ""
+
+    # List/original price (when eBay provides it)
+    marketing = s.get("marketingPrice", {}) or {}
+    original = marketing.get("originalPrice", {}) or {}
+    orig_val = original.get("value")
+    orig_cur = original.get("currency", currency)
+    list_price_string = f"{orig_cur} {orig_val}" if orig_val is not None else ""
+
+    # Fallback: `unitPrice` sometimes exists, but is not the same as original/list price.
+    if not list_price_string:
+        unit = s.get("unitPrice", {}) or {}
+        unit_val = unit.get("value")
+        unit_cur = unit.get("currency", currency)
+        if unit_val is not None:
+            list_price_string = f"{unit_cur} {unit_val}"
     image_obj = s.get("image", {}) or {}
     thumbnail = image_obj.get("imageUrl", "")
     item_web_url = s.get("itemWebUrl", "") or f"https://www.ebay.com/itm/{item_id}"
@@ -100,8 +116,8 @@ def _item_summary_to_listing(s: dict[str, Any]) -> dict[str, Any]:
         "priceString": price_string,
         "listPriceString": list_price_string or price_string,
         "condition": condition,
-        "sellerName": "",
-        "sellerFeedbackPercent": "",
+        "sellerName": seller_name,
+        "sellerFeedbackPercent": seller_feedback_percent,
         "soldCount": "",
         "listingType": listing_type,
         "url": item_web_url,
