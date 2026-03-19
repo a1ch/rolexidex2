@@ -66,25 +66,11 @@ def get_engine():
                 if ipv4_addrs:
                     ipv4 = ipv4_addrs[0][4][0]
 
-                    # 1) Prefer passing hostaddr to avoid DNS issues.
+                    # Only pass hostaddr: connect over IPv4 but KEEP the real hostname in the URL.
+                    # Rewriting host to a raw IP breaks Supabase pooler (FATAL: Tenant or user not found).
                     connect_args = kwargs.get("connect_args") or {}
                     connect_args["hostaddr"] = ipv4
                     kwargs["connect_args"] = connect_args
-
-                    # 2) Also rewrite URL host to IPv4 (extra safety).
-                    # Rebuild netloc while preserving username/password and port.
-                    userinfo = ""
-                    if parsed.username is not None:
-                        userinfo = parsed.username
-                        if parsed.password is not None:
-                            userinfo += ":" + parsed.password
-                        userinfo += "@"
-
-                    port = f":{parsed.port}" if parsed.port else ""
-                    new_netloc = f"{userinfo}{ipv4}{port}"
-                    url = urllib.parse.urlunsplit(
-                        (parsed.scheme, new_netloc, parsed.path, parsed.query, parsed.fragment)
-                    )
         except Exception:
             pass
     return create_engine(url, **kwargs)
