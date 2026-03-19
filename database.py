@@ -7,10 +7,12 @@ from __future__ import annotations
 
 import math
 import os
+import socket
 from datetime import datetime, timezone
 from typing import Any
 
 from sqlalchemy import create_engine, text
+from sqlalchemy.engine import make_url
 
 
 def _sanitize(val: Any) -> Any:
@@ -52,6 +54,19 @@ def get_engine():
     kwargs = {"pool_pre_ping": True}
     if "supabase" in url.lower():
         kwargs["connect_args"] = {"sslmode": "require"}
+
+        # Streamlit Cloud sometimes ends up trying IPv6 routes for Supabase hosts.
+        # If IPv6 isn't reachable, you may see: "Cannot assign requested address".
+        # We try to force IPv4 by resolving the hostname via AF_INET.
+        try:
+            u = make_url(url)
+            if u.host and "supabase.co" in u.host:
+                ipv4_addrs = socket.getaddrinfo(u.host, None, socket.AF_INET)
+                if ipv4_addrs:
+                    ipv4 = ipv4_addrs[0][4][0]
+                    url = str(u.set(host=ipv4))
+        except Exception:
+            pass
     return create_engine(url, **kwargs)
 
 
