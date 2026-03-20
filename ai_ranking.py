@@ -19,11 +19,20 @@ try:
 except ImportError:
     Anthropic = None
 
-# Anthropic: if the primary model 404s, try fallbacks (IDs change over time).
+# Cheapest usable defaults (override via function args if you prefer).
+# OpenAI: gpt-5-nano is very cheap when available; fall back to gpt-4o-mini.
+OPENAI_MODEL_DEFAULT = "gpt-5-nano"
+OPENAI_MODEL_FALLBACKS = ("gpt-4o-mini",)
+
+# Anthropic: Haiku-class is the cheap tier; fall back if an ID 404s.
+ANTHROPIC_MODEL_DEFAULT = "claude-haiku-4-5-20251001"
 ANTHROPIC_MODEL_FALLBACKS = (
     "claude-haiku-4-5",
     "claude-3-5-sonnet-20241022",
 )
+
+# Smaller batches = valid JSON + full scores (one huge response often truncates → all 5s).
+AI_BATCH_SIZE = 7
 
 
 def _get_openai_client(api_key: str) -> OpenAI | None:
@@ -81,13 +90,19 @@ def _parse_ai_response(text: str, n_expected: int) -> list[dict[str, Any]]:
     result = []
     for i, row in enumerate(data[:n_expected]):
         if isinstance(row, dict):
+            # Accept numeric strings; authenticity may be named differently
             result.append({
                 "quality_score": _safe_float(row.get("quality_score") or row.get("quality")),
                 "pricing_score": _safe_float(row.get("pricing_score") or row.get("pricing")),
                 "trend_score": _safe_float(row.get("trend_score") or row.get("trend")),
                 "overall_ai_score": _safe_float(row.get("overall_ai_score") or row.get("overall_score") or row.get("overall")),
                 "summary": _safe_str(row.get("summary") or row.get("one_line") or row.get("reason")),
-                "authenticity_risk": _safe_float(row.get("authenticity_risk") or row.get("authenticity") or 5.0),
+                "authenticity_risk": _safe_float(
+                    row.get("authenticity_risk")
+                    or row.get("authenticity")
+                    or row.get("fake_risk")
+                    or 5.0
+                ),
                 "authenticity_note": _safe_str(row.get("authenticity_note") or row.get("auth_note") or ""),
             })
         else:
@@ -121,7 +136,7 @@ def _safe_str(x: Any) -> str:
 def run_ai_ranking_openai(
     items: list[dict[str, Any]],
     api_key: str,
-    model: str = "gpt-4o-mini",
+    model: str = OPENAI_MODEL_DEFAULT,
     max_items: int = 30,
 ) -> list[dict[str, Any]]:
     """Run AI ranking using OpenAI. Returns items with added ai_* fields."""
@@ -133,13 +148,111 @@ def run_ai_ranking_openai(
 def run_ai_ranking_anthropic(
     items: list[dict[str, Any]],
     api_key: str,
-    model: str = "claude-haiku-4-5-20251001",
+    model: str = ANTHROPIC_MODEL_DEFAULT,
     max_items: int = 30,
 ) -> list[dict[str, Any]]:
     """Run AI ranking using Anthropic. Returns items with added ai_* fields."""
     if not _get_anthropic_client(api_key):
         raise RuntimeError("anthropic package not installed. pip install anthropic")
     return _run_ai_ranking(items, api_key, "anthropic", model, max_items)
+
+
+def _anthropic_message_text(msg: Any) -> str:
+    """Join all text blocks (avoid empty answer if first block isn't text)."""
+    parts: list[str] = []
+    for block in getattr(msg, "content", None) or []:
+        txt = getattr(block, "text", None)
+        if txt:
+            parts.append(txt)
+    return "".join(parts)
+
+
+def _build_batch_prompt(batch: list[dict[str, Any]], offset: int) -> str:
+    lines = [_build_watch_summary(item, offset + i) for i, item in enumerate(batch)]
+    listing_text = "\n".join(lines)
+    n = len(batch)
+    return f"""You are an expert in luxury watches and eBay marketplace deals. Score each listing below.
+
+Listings (each line is one row; [index] is the global index):
+{listing_text}
+
+There are EXACTLY {n} listings in this batch. Return EXACTLY {n} JSON objects in a single array, in the SAME ORDER.
+
+For EACH listing provide integers/floats 1-10 (use varied scores when listings differ; do NOT default every field to 5):
+1. quality_score (1-10): quality from title, condition, brand cues.
+2. pricing_score (1-10): price vs list/discount and value.
+3. trend_score (1-10): seller feedback / demand signals.
+4. overall_ai_score (1-10): overall deal quality.
+5. summary: max 15 words.
+6. authenticity_risk (1-10): 10 = likely genuine, 1 = strong replica/red-flag signals.
+7. authenticity_note: short phrase.
+
+Return ONLY valid JSON: one array, no markdown, no commentary. Example schema:
+[{{"quality_score":7,"pricing_score":8,"trend_score":6,"overall_ai_score":7,"summary":"...","authenticity_risk":8,"authenticity_note":"..."}}]
+"""
+
+
+def _default_pad_row() -> dict[str, Any]:
+    return {
+        "quality_score": 5.0,
+        "pricing_score": 5.0,
+        "trend_score": 5.0,
+        "overall_ai_score": 5.0,
+        "summary": "(AI parse failed for this row)",
+        "authenticity_risk": 5.0,
+        "authenticity_note": "",
+    }
+
+
+def _call_openai_batch(client: Any, models: list[str], prompt: str) -> str:
+    last: Exception | None = None
+    for m in models:
+        if not m:
+            continue
+        try:
+            resp = client.chat.completions.create(
+                model=m,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.55,
+                max_tokens=4096,
+            )
+            text = (resp.choices[0].message.content or "").strip()
+            if text:
+                return text
+        except Exception as e:
+            err = str(e).lower()
+            if "model" in err or "404" in str(e) or "does not exist" in err:
+                last = e
+                continue
+            raise
+    if last:
+        raise last
+    return ""
+
+
+def _call_anthropic_batch(client: Any, models: list[str], prompt: str) -> str:
+    last_err: Exception | None = None
+    for m in models:
+        if not m:
+            continue
+        try:
+            msg = client.messages.create(
+                model=m,
+                max_tokens=4096,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            text = _anthropic_message_text(msg).strip()
+            if text:
+                return text
+        except Exception as e:
+            err = str(e).lower()
+            if "404" in str(e) or "not_found" in err:
+                last_err = e
+                continue
+            raise
+    if last_err:
+        raise last_err
+    return ""
 
 
 def _run_ai_ranking(
@@ -154,72 +267,40 @@ def _run_ai_ranking(
     if not subset:
         return items
 
-    lines = [_build_watch_summary(item, i) for i, item in enumerate(subset)]
-    listing_text = "\n".join(lines)
-
-    prompt = f"""You are an expert in luxury watches and eBay marketplace deals. Analyze these eBay watch listings and score each one.
-
-Listings (each line is one listing, [index] at start):
-{listing_text}
-
-For each listing index 0 to {len(subset)-1}, provide:
-1. quality_score (1-10): perceived quality from title, condition, brand cues (e.g. Rolex, Omega).
-2. pricing_score (1-10): how good the price is vs list price and typical market (discount, value).
-3. trend_score (1-10): demand/popularity from seller feedback and sold count.
-4. overall_ai_score (1-10): overall deal quality combining quality, pricing, and trend.
-5. summary: one short sentence (max 15 words) on why it's a good or weak deal.
-6. authenticity_risk (1-10): risk of replica/fake — 10 = likely genuine, 1 = strong red flags (e.g. "replica", "homage", unrealistically low price, sketchy seller).
-7. authenticity_note: one short phrase (e.g. "Looks legit" or "Replica keywords in title").
-
-Return ONLY a JSON array of objects, one per listing in order. No other text.
-Example: [{{"quality_score": 7, "pricing_score": 8, "trend_score": 6, "overall_ai_score": 7, "summary": "Strong discount.", "authenticity_risk": 8, "authenticity_note": "No red flags"}}, ...]
-"""
-
     if provider == "openai":
         client = OpenAI(api_key=api_key)
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
-        )
-        text = resp.choices[0].message.content or ""
+        models_try: list[str] = []
+        for m in (model, *OPENAI_MODEL_FALLBACKS):
+            if m and m not in models_try:
+                models_try.append(m)
     else:
         client = Anthropic(api_key=api_key)
-        models_to_try: list[str] = []
+        models_try = []
         for m in (model, *ANTHROPIC_MODEL_FALLBACKS):
-            if m and m not in models_to_try:
-                models_to_try.append(m)
-        text = ""
-        last_err: Exception | None = None
-        for m in models_to_try:
-            try:
-                msg = client.messages.create(
-                    model=m,
-                    max_tokens=2048,
-                    messages=[{"role": "user", "content": prompt}],
-                )
-                text = (msg.content[0].text if msg.content else "") or ""
-                break
-            except Exception as e:
-                err = str(e).lower()
-                if "404" in str(e) or "not_found" in err:
-                    last_err = e
-                    continue
-                raise
-        if not text and last_err:
-            raise last_err
+            if m and m not in models_try:
+                models_try.append(m)
 
-    parsed = _parse_ai_response(text, len(subset))
+    parsed_all: list[dict[str, Any]] = []
+    for start in range(0, len(subset), AI_BATCH_SIZE):
+        batch = subset[start : start + AI_BATCH_SIZE]
+        prompt = _build_batch_prompt(batch, start)
+        if provider == "openai":
+            text = _call_openai_batch(client, models_try, prompt)
+        else:
+            text = _call_anthropic_batch(client, models_try, prompt)
+
+        parsed = _parse_ai_response(text, len(batch))
+        if len(parsed) != len(batch):
+            while len(parsed) < len(batch):
+                parsed.append(_default_pad_row())
+            parsed = parsed[: len(batch)]
+        parsed_all.extend(parsed)
+
+    parsed = parsed_all
     if len(parsed) != len(subset):
-        # Pad with defaults if LLM returned fewer
         while len(parsed) < len(subset):
-            parsed.append({
-                "quality_score": 5.0,
-                "pricing_score": 5.0,
-                "trend_score": 5.0,
-                "overall_ai_score": 5.0,
-                "summary": "",
-            })
+            parsed.append(_default_pad_row())
+        parsed = parsed[: len(subset)]
 
     # Merge back into items (only subset gets AI fields)
     result = []

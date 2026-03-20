@@ -29,6 +29,7 @@ from database import (
     is_remote_database_configured,
 )
 from datetime import datetime, timezone, timedelta
+from typing import Any
 
 st.set_page_config(
     page_title="Luxury Watch Deals | AI Rankings",
@@ -84,22 +85,144 @@ def _ensure_fake_risk(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _listing_href_for_title(row: pd.Series) -> str:
+    """Build auction URL with #title-slug so LinkColumn can show the watch name (Streamlit has no per-row link text)."""
+    base = (row.get("url") or "").strip()
+    if not base and row.get("itemId"):
+        base = f"https://www.ebay.com/itm/{row.get('itemId')}"
+    if not base:
+        return ""
+    title = str(row.get("title") or "View listing").strip()
+    slug = re.sub(r"[^\w\s-]", "", title, flags=re.UNICODE)
+    slug = re.sub(r"[-\s]+", "-", slug).strip("-")[:100]
+    if not slug:
+        slug = "View-listing"
+    return f"{base}#{slug}"
+
+
+def _deal_score_rgb(val: Any, vmin: float, vmax: float) -> str:
+    """Interpolate red (low deal score) -> green (high deal score)."""
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        return "#9e9e9e"
+    if pd.isna(v):
+        return "#9e9e9e"
+    lo, hi = float(vmin), float(vmax)
+    if hi <= lo:
+        t = 0.5
+    else:
+        t = (v - lo) / (hi - lo)
+    t = max(0.0, min(1.0, t))
+    # RdYlGn-like endpoints (red -> green)
+    r = int(215 * (1 - t) + 26 * t)
+    g = int(48 * (1 - t) + 152 * t)
+    b = int(39 * (1 - t) + 80 * t)
+    return f"rgb({r},{g},{b})"
+
+
+def _fake_risk_rgb(val: Any) -> str:
+    """Fake risk 0–100: 0 = green (safest), 100 = red (riskiest)."""
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        return "#9e9e9e"
+    if pd.isna(v):
+        return "#9e9e9e"
+    t = max(0.0, min(1.0, v / 100.0))
+    r = int(26 + (215 - 26) * t)
+    g = int(152 + (48 - 152) * t)
+    b = int(80 + (39 - 80) * t)
+    return f"rgb({r},{g},{b})"
+
+
+def _style_deal_score_table(
+    df: pd.DataFrame,
+    score_col: str,
+    *,
+    vmin: float | None = None,
+    vmax: float | None = None,
+    fake_risk_col: str | None = None,
+) -> Any:
+    """Pandas Styler: green = best, red = worst (uses vmin/vmax or column range on this page)."""
+    fmt: dict[str, str] = {}
+    if "deal_score" in df.columns:
+        fmt["deal_score"] = "{:.1f}"
+    if "fake_risk_score" in df.columns:
+        fmt["fake_risk_score"] = "{:.0f}"
+    if "discount_pct" in df.columns:
+        fmt["discount_pct"] = "{:.1f}"
+    if "ai_overall_score" in df.columns:
+        fmt["ai_overall_score"] = "{:.1f}"
+    if "ai_authenticity_risk" in df.columns:
+        fmt["ai_authenticity_risk"] = "{:.1f}"
+    if "ai_quality_score" in df.columns:
+        fmt["ai_quality_score"] = "{:.1f}"
+    if "ai_pricing_score" in df.columns:
+        fmt["ai_pricing_score"] = "{:.1f}"
+    if "ai_trend_score" in df.columns:
+        fmt["ai_trend_score"] = "{:.1f}"
+
+    sty = df.style
+    if score_col in df.columns:
+        s = pd.to_numeric(df[score_col], errors="coerce")
+        lo = vmin if vmin is not None else float(s.min())
+        hi = vmax if vmax is not None else float(s.max())
+        if pd.isna(lo) or pd.isna(hi):
+            lo, hi = 0.0, 100.0
+        elif hi <= lo:
+            hi = lo + 1e-9
+        sty = sty.background_gradient(
+            subset=[score_col],
+            cmap="RdYlGn",
+            vmin=lo,
+            vmax=hi,
+            axis=None,
+        )
+    if fake_risk_col and fake_risk_col in df.columns:
+        # 0 = green (low risk), 100 = red (high risk) — absolute scale
+        sty = sty.background_gradient(
+            subset=[fake_risk_col],
+            cmap="RdYlGn_r",
+            vmin=0.0,
+            vmax=100.0,
+            axis=None,
+        )
+    if fmt:
+        sty = sty.format(fmt, na_rep="—")
+    return sty
+
+
 def _render_rule_based(df: pd.DataFrame) -> None:
     """Rule-based ranking view."""
     st.subheader("Rankings by deal score (rule-based)")
-    st.caption("Formula: 35% price/discount + 30% condition + 20% seller feedback + 15% popularity. **Fake risk** = rule-based replica/fake detection.")
+    st.caption(
+        "Formula: 35% price/discount + 30% condition + 20% seller feedback + 15% popularity. **Fake risk** = rule-based replica/fake detection. "
+        "**Deal score**: green → red (green = best on this page). **Fake risk** %: green at **0** → red at **100** (absolute scale)."
+    )
     display_cols = [
-        "deal_score", "fake_risk_score", "fake_risk_level", "title", "priceString", "listPriceString", "discount_pct",
-        "condition_normalized", "sellerFeedbackPercent", "soldCount", "listingType", "url",
+        "deal_score", "fake_risk_score", "fake_risk_level", "title_link", "priceString", "listPriceString", "discount_pct",
+        "condition_normalized", "sellerFeedbackPercent", "soldCount", "listingType",
     ]
-    available = [c for c in display_cols if c in df.columns]
+    disp = df.head(1000).copy()
+    disp["title_link"] = disp.apply(_listing_href_for_title, axis=1)
+    available = [c for c in display_cols if c in disp.columns]
+    styled = _style_deal_score_table(
+        disp[available],
+        "deal_score",
+        fake_risk_col="fake_risk_score",
+    )
     st.dataframe(
-        df[available].head(1000),
+        styled,
         column_config={
             "deal_score": st.column_config.NumberColumn("Deal score", format="%.1f"),
             "fake_risk_score": st.column_config.NumberColumn("Fake risk", format="%.0f"),
             "fake_risk_level": st.column_config.TextColumn("Risk level"),
-            "title": st.column_config.TextColumn("Title", width="large"),
+            "title_link": st.column_config.LinkColumn(
+                "Title",
+                width="large",
+                display_text=r"#(.+)$",
+            ),
             "priceString": st.column_config.TextColumn("Price"),
             "listPriceString": st.column_config.TextColumn("List price"),
             "discount_pct": st.column_config.NumberColumn("Discount %", format="%.1f"),
@@ -107,7 +230,6 @@ def _render_rule_based(df: pd.DataFrame) -> None:
             "sellerFeedbackPercent": st.column_config.TextColumn("Seller %"),
             "soldCount": st.column_config.TextColumn("Sold"),
             "listingType": st.column_config.TextColumn("Type"),
-            "url": st.column_config.LinkColumn("View auction", display_text="→ Open"),
         },
         use_container_width=True,
         hide_index=True,
@@ -124,15 +246,20 @@ def _render_ai_ranking(df: pd.DataFrame) -> None:
         st.warning("No AI-scored items yet.")
         return
     st.subheader("Rankings by AI analysis")
-    st.caption("Scores from LLM: quality, pricing, trends, and overall deal assessment.")
+    st.caption(
+        "Scores from LLM: quality, pricing, trends, and overall deal assessment. "
+        "**AI overall** uses **green → red** for scale **1–10** (green = best)."
+    )
     display_cols = [
         "ai_overall_score", "ai_quality_score", "ai_pricing_score", "ai_trend_score",
         "ai_authenticity_risk", "title", "priceString", "listPriceString", "ai_summary",
         "condition_normalized", "sellerFeedbackPercent", "url",
     ]
     available = [c for c in display_cols if c in df_ai.columns]
+    ai_show = df_ai[available].head(1000)
+    styled_ai = _style_deal_score_table(ai_show, "ai_overall_score", vmin=1.0, vmax=10.0)
     st.dataframe(
-        df_ai[available].head(1000),
+        styled_ai,
         column_config={
             "ai_overall_score": st.column_config.NumberColumn("AI overall", format="%.1f"),
             "ai_authenticity_risk": st.column_config.NumberColumn("AI authenticity (10=likely genuine)", format="%.1f"),
@@ -154,6 +281,13 @@ def _render_ai_ranking(df: pd.DataFrame) -> None:
 
 def _render_datasheets(df: pd.DataFrame, use_ai: bool) -> None:
     """Expandable watch cards; use_ai=True shows AI scores when present."""
+    d_lo = d_hi = None
+    if "deal_score" in df.columns and not df.empty:
+        ds = pd.to_numeric(df["deal_score"], errors="coerce")
+        d_lo, d_hi = float(ds.min()), float(ds.max())
+        if pd.isna(d_lo) or pd.isna(d_hi) or d_hi <= d_lo:
+            d_hi = d_lo + 1e-9
+
     n_cards = min(20, len(df))
     for i in range(n_cards):
         row = df.iloc[i]
@@ -187,7 +321,15 @@ def _render_datasheets(df: pd.DataFrame, use_ai: bool) -> None:
                     if pd.notna(row.get("ai_authenticity_risk")):
                         st.write("**AI authenticity:**", f"{row['ai_authenticity_risk']:.1f}/10", "—", row.get("ai_authenticity_note") or "")
                 else:
-                    st.metric("Deal score", f"{row['deal_score']}")
+                    if d_lo is not None and pd.notna(row.get("deal_score")):
+                        css = _deal_score_rgb(row["deal_score"], d_lo, d_hi or d_lo + 1)
+                        st.markdown(
+                            f'<p style="margin:0;font-size:1.35rem;font-weight:700;color:{css};">'
+                            f"Deal score: {row['deal_score']}</p>",
+                            unsafe_allow_html=True,
+                        )
+                    else:
+                        st.metric("Deal score", f"{row['deal_score']}")
                 st.write("**Price:**", row.get("priceString", "—"))
                 st.write("**List price:**", row.get("listPriceString", "—"))
                 st.write("**Discount:**", f"{row.get('discount_pct', 0)}%")
@@ -200,8 +342,12 @@ def _render_datasheets(df: pd.DataFrame, use_ai: bool) -> None:
                 risk = row.get("fake_risk_score")
                 level = row.get("fake_risk_level", "")
                 if pd.notna(risk):
-                    color = "red" if level == "high" else "orange" if level == "medium" else "green"
-                    st.markdown(f"**Likelihood of fake:** :{color}[{risk:.0f}% — {level}]")
+                    css = _fake_risk_rgb(risk)
+                    st.markdown(
+                        f'<p style="margin:0;font-weight:600;color:{css};">'
+                        f"Likelihood of fake: {risk:.0f}% — {level}</p>",
+                        unsafe_allow_html=True,
+                    )
                     reasons = row.get("fake_reasons") or []
                     if reasons:
                         for r in reasons[:3]:
