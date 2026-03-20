@@ -19,6 +19,7 @@ build/
 # IDE / OS
 .idea/
 .vscode/
+.mcp.json
 *.swp
 .DS_Store
 Thumbs.db
