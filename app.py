@@ -58,6 +58,29 @@ def _ai_error_message(e: Exception) -> str:
     return str(e)
 
 
+def _persist_listings_with_ai(engine: Any, df: pd.DataFrame | None) -> None:
+    """Write listings + AI scores to SQLite/Postgres so the next session can load without re-running AI."""
+    if engine is None or df is None or df.empty:
+        return
+    try:
+        save_listings(engine, df.to_dict("records"))
+    except Exception:
+        pass
+
+
+def _sync_ai_session_from_df(df: pd.DataFrame | None) -> None:
+    """Restore AI rankings tab when rows were loaded from DB with saved ai_* fields."""
+    if df is None or df.empty:
+        return
+    if "ai_overall_score" not in df.columns:
+        st.session_state.pop("watch_df_ai", None)
+        return
+    if df["ai_overall_score"].notna().any():
+        st.session_state["watch_df_ai"] = items_to_dataframe_ai(df.to_dict("records"))
+    else:
+        st.session_state.pop("watch_df_ai", None)
+
+
 # Custom CSS
 st.markdown("""
 <style>
@@ -252,9 +275,11 @@ def _render_ai_ranking(df: pd.DataFrame) -> None:
     )
     display_cols = [
         "ai_overall_score", "ai_quality_score", "ai_pricing_score", "ai_trend_score",
-        "ai_authenticity_risk", "title", "priceString", "listPriceString", "ai_summary",
-        "condition_normalized", "sellerFeedbackPercent", "url",
+        "ai_authenticity_risk", "title_link", "priceString", "listPriceString", "ai_summary",
+        "condition_normalized", "sellerFeedbackPercent",
     ]
+    df_ai = df_ai.copy()
+    df_ai["title_link"] = df_ai.apply(_listing_href_for_title, axis=1)
     available = [c for c in display_cols if c in df_ai.columns]
     ai_show = df_ai[available].head(1000)
     styled_ai = _style_deal_score_table(ai_show, "ai_overall_score", vmin=1.0, vmax=10.0)
@@ -266,13 +291,16 @@ def _render_ai_ranking(df: pd.DataFrame) -> None:
             "ai_quality_score": st.column_config.NumberColumn("Quality", format="%.1f"),
             "ai_pricing_score": st.column_config.NumberColumn("Pricing", format="%.1f"),
             "ai_trend_score": st.column_config.NumberColumn("Trend", format="%.1f"),
-            "title": st.column_config.TextColumn("Title", width="large"),
+            "title_link": st.column_config.LinkColumn(
+                "Title",
+                width="large",
+                display_text=r"#(.+)$",
+            ),
             "priceString": st.column_config.TextColumn("Price"),
             "listPriceString": st.column_config.TextColumn("List price"),
             "ai_summary": st.column_config.TextColumn("AI summary", width="medium"),
             "condition_normalized": st.column_config.TextColumn("Condition"),
             "sellerFeedbackPercent": st.column_config.TextColumn("Seller %"),
-            "url": st.column_config.LinkColumn("View auction", display_text="→ Open"),
         },
         use_container_width=True,
         hide_index=True,
@@ -646,26 +674,36 @@ def main():
     if st.session_state.pop("_trigger_scrape_next", False):
         run_clicked = True
 
-    # Preload last scrape from DB when we have no data (first load or empty session)
+    # Once per browser session: auto-load last scrape + any saved AI from DB (no button click)
     try:
         engine = get_engine()
     except Exception:
         engine = None
-    need_data = "watch_df" not in st.session_state or st.session_state.get("watch_df") is None or (
-        isinstance(st.session_state.get("watch_df"), pd.DataFrame) and st.session_state["watch_df"].empty
-    )
     preload_error: str | None = None
-    if engine and need_data:
+    if engine and not st.session_state.get("_db_auto_loaded"):
+        st.session_state["_db_auto_loaded"] = True
         try:
             cached = get_listings(engine)
             if cached:
                 df_cached = pd.DataFrame(cached).sort_values("deal_score", ascending=False).reset_index(drop=True)
                 st.session_state["watch_df"] = df_cached
                 st.session_state["watch_items"] = cached
+                _sync_ai_session_from_df(df_cached)
+                n_ai = sum(1 for x in cached if x.get("ai_overall_score") is not None)
+                if n_ai:
+                    st.session_state["_auto_load_notice"] = (
+                        f"Loaded **{len(cached)}** listings from your database "
+                        f"({n_ai} with saved **AI** analysis)."
+                    )
+                else:
+                    st.session_state["_auto_load_notice"] = f"Loaded **{len(cached)}** listings from your database."
         except Exception as e:
             preload_error = str(e)
 
-    if preload_error and need_data:
+    if msg := st.session_state.pop("_auto_load_notice", None):
+        st.info(msg)
+
+    if preload_error and has_cloud_db:
         st.error(f"**Could not load from database:** {preload_error}")
         st.caption("Check **DATABASE_URL** in secrets (use `postgresql://` for Supabase) and that the DB is reachable.")
 
@@ -732,6 +770,7 @@ def main():
                         df_ai = items_to_dataframe_ai(scored)
                         st.session_state["watch_df"] = df_ai
                         st.session_state["watch_df_ai"] = df_ai
+                        _persist_listings_with_ai(engine, df_ai)
                         st.success("AI ranking complete.")
                     except Exception as e:
                         st.error("AI failed: " + _ai_error_message(e))
@@ -745,8 +784,7 @@ def main():
                 df_cached = pd.DataFrame(cached).sort_values("deal_score", ascending=False).reset_index(drop=True)
                 st.session_state["watch_df"] = df_cached
                 st.session_state["watch_items"] = cached
-                if "watch_df_ai" in st.session_state:
-                    del st.session_state["watch_df_ai"]
+                _sync_ai_session_from_df(df_cached)
                 st.sidebar.success(f"Loaded {len(cached)} listings from database.")
             else:
                 st.sidebar.warning("Database is empty. Run a scrape first.")
@@ -800,6 +838,7 @@ def main():
                                         df_ai = items_to_dataframe_ai(scored)
                                         st.session_state["watch_df"] = df_ai
                                         st.session_state["watch_df_ai"] = df_ai
+                                        _persist_listings_with_ai(engine, df_ai)
                                     except Exception as e:
                                         st.warning("AI after refresh failed: " + _ai_error_message(e))
                     else:
@@ -825,13 +864,17 @@ def main():
         st.info(
             "No listings in this session yet."
             + db_hint
-            + " Click **▶ Start scanning** (needs API keys), or **Load last scrape from DB** in the sidebar."
+            + " When your database has data, the app **auto-loads** the last scrape and any saved **AI** scores on open. "
+            "Click **▶ Start scanning** (needs API keys), or **Load last scrape from DB** in the sidebar to retry."
         )
         if can_scan and st.button("▶ Start scanning", type="primary", key="start_scan_empty_state"):
             st.session_state["_trigger_scrape_next"] = True
             st.rerun()
         elif not can_scan and has_cloud_db:
-            st.caption("You can only load from DB right now — use **Load last scrape from DB** in the sidebar.")
+            st.caption(
+                "Listings and saved AI load automatically when the database has rows. "
+                "**Load last scrape from DB** pulls the latest again (e.g. after a GitHub refresh)."
+            )
         return
 
     df = st.session_state["watch_df"]
@@ -867,6 +910,7 @@ def main():
                     df_ai = items_to_dataframe_ai(scored)
                     st.session_state["watch_df"] = df_ai
                     st.session_state["watch_df_ai"] = df_ai
+                    _persist_listings_with_ai(engine, df_ai)
                     st.success("AI ranking complete.")
                 except Exception as e:
                     st.error("AI analysis failed: " + _ai_error_message(e))

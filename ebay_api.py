@@ -5,11 +5,19 @@ Returns listings in the same format as the Apify scraper so the rest of the app 
 from __future__ import annotations
 
 import base64
+import hashlib
+import json
 import os
+import threading
+import time
 import urllib.parse
 import urllib.request
 import urllib.error
 from typing import Any
+
+# Reuse OAuth tokens until near expiry (eBay typically returns expires_in ~7200s).
+_oauth_lock = threading.Lock()
+_oauth_cache: dict[str, tuple[str, float]] = {}
 
 # Production; use api.sandbox.ebay.com for sandbox
 IDENTITY_URL_PROD = "https://api.ebay.com/identity/v1/oauth2/token"
@@ -34,8 +42,20 @@ def _browse_url() -> str:
     return BROWSE_URL_SANDBOX if _use_sandbox_from_env() else BROWSE_URL_PROD
 
 
+def _oauth_cache_key(client_id: str, client_secret: str) -> str:
+    return hashlib.sha256(f"{client_id}\0{client_secret}".encode()).hexdigest()
+
+
 def get_oauth_token(client_id: str, client_secret: str) -> str:
-    """Get Application access token via client credentials grant."""
+    """Get Application access token via client credentials grant (cached ~until expiry)."""
+    cache_key = _oauth_cache_key(client_id, client_secret)
+    now = time.monotonic()
+    with _oauth_lock:
+        if cache_key in _oauth_cache:
+            tok, exp = _oauth_cache[cache_key]
+            if now < exp:
+                return tok
+
     credentials = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
     data = urllib.parse.urlencode({
         "grant_type": "client_credentials",
@@ -52,7 +72,7 @@ def get_oauth_token(client_id: str, client_secret: str) -> str:
     )
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            out = __import__("json").load(resp)
+            out = json.load(resp)
     except urllib.error.HTTPError as e:
         body = ""
         try:
@@ -66,7 +86,16 @@ def get_oauth_token(client_id: str, client_secret: str) -> str:
             f"eBay OAuth token request failed: HTTP {e.code} {e.reason}.{(' Response: ' + body[:500]) if body else ''} "
             f"Check that your Client ID/Secret pair is correct and that sandbox/production endpoints match your keys."
         ) from e
-    return out["access_token"]
+
+    access_token = out["access_token"]
+    # Refresh a bit before eBay revokes (default 2h if omitted).
+    expires_in = int(out.get("expires_in") or 7200)
+    skew = max(120, min(600, expires_in // 12))
+    expire_at = time.monotonic() + max(60, expires_in - skew)
+
+    with _oauth_lock:
+        _oauth_cache[cache_key] = (access_token, expire_at)
+    return access_token
 
 
 def _item_summary_to_listing(s: dict[str, Any]) -> dict[str, Any]:
@@ -148,9 +177,13 @@ def run_ebay_api_search(
         offset = 0
         limit = min(limit_per_query, 200)  # API often caps at 200 per request
         while offset < limit_per_query and len(all_items) < max_total:
+            room = max_total - len(all_items)
+            page_limit = min(200, limit_per_query - offset, room)
+            if page_limit <= 0:
+                break
             params = urllib.parse.urlencode({
                 "q": q[:100],
-                "limit": min(200, limit_per_query - offset),
+                "limit": page_limit,
                 "offset": offset,
             })
             url = f"{browse_url}?{params}"
@@ -162,7 +195,7 @@ def run_ebay_api_search(
             req = urllib.request.Request(url, headers=headers, method="GET")
             try:
                 with urllib.request.urlopen(req, timeout=30) as resp:
-                    data = __import__("json").load(resp)
+                    data = json.load(resp)
             except Exception as e:
                 # Try to include response body for easier debugging (e.g. invalid token / wrong keys).
                 body = ""
@@ -185,7 +218,7 @@ def run_ebay_api_search(
                     seen_ids.add(item_id)
                     all_items.append(_item_summary_to_listing(s))
             offset += len(summaries)
-            if len(summaries) < 200:
+            if len(summaries) < page_limit:
                 break
 
     return all_items

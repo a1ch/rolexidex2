@@ -116,11 +116,35 @@ def init_db(engine=None):
             )
         """))
         conn.commit()
+    _migrate_listings_ai_columns(engine)
+
+
+_AI_COLUMN_DEFS = (
+    "ai_overall_score REAL",
+    "ai_quality_score REAL",
+    "ai_pricing_score REAL",
+    "ai_trend_score REAL",
+    "ai_authenticity_risk REAL",
+    "ai_summary TEXT",
+    "ai_authenticity_note TEXT",
+)
+
+
+def _migrate_listings_ai_columns(engine) -> None:
+    """Add AI ranking columns to existing listings tables (idempotent)."""
+    with engine.connect() as conn:
+        for coldef in _AI_COLUMN_DEFS:
+            try:
+                conn.execute(text(f"ALTER TABLE listings ADD COLUMN {coldef}"))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                pass
 
 
 def _row_to_item(row) -> dict[str, Any]:
     """Convert DB row to dict matching scraper output for app/AI."""
-    return {
+    out: dict[str, Any] = {
         "itemId": row[1],
         "title": row[2],
         "price": row[3],
@@ -143,10 +167,21 @@ def _row_to_item(row) -> dict[str, Any]:
         "trend_score": row[21],
         "sold_count_num": row[11] or 0,
     }
+    # AI columns (migration); short tuples = pre-migration DB
+    if len(row) > 23:
+        out["ai_overall_score"] = row[23]
+        out["ai_quality_score"] = row[24]
+        out["ai_pricing_score"] = row[25]
+        out["ai_trend_score"] = row[26]
+        out["ai_authenticity_risk"] = row[27]
+        out["ai_summary"] = row[28]
+        out["ai_authenticity_note"] = row[29]
+    return out
 
 
 def save_listings(engine, items: list[dict[str, Any]]) -> None:
     """Replace all listings with the new scrape and update metadata."""
+    init_db(engine)
     with engine.connect() as conn:
         conn.execute(text("DELETE FROM listings"))
         conn.execute(text("DELETE FROM scrape_metadata"))
@@ -158,13 +193,17 @@ def save_listings(engine, items: list[dict[str, Any]]) -> None:
                     condition, condition_normalized, seller_name, seller_feedback_percent,
                     sold_count, sold_count_num, listing_type, url, thumbnail,
                     deal_score, discount_pct, price_value, list_price_value,
-                    condition_score, seller_score, trend_score, scraped_at
+                    condition_score, seller_score, trend_score, scraped_at,
+                    ai_overall_score, ai_quality_score, ai_pricing_score, ai_trend_score,
+                    ai_authenticity_risk, ai_summary, ai_authenticity_note
                 ) VALUES (
                     :item_id, :title, :price, :price_string, :list_price_string,
                     :condition, :condition_normalized, :seller_name, :seller_feedback_percent,
                     :sold_count, :sold_count_num, :listing_type, :url, :thumbnail,
                     :deal_score, :discount_pct, :price_value, :list_price_value,
-                    :condition_score, :seller_score, :trend_score, :scraped_at
+                    :condition_score, :seller_score, :trend_score, :scraped_at,
+                    :ai_overall_score, :ai_quality_score, :ai_pricing_score, :ai_trend_score,
+                    :ai_authenticity_risk, :ai_summary, :ai_authenticity_note
                 )
             """), {
                 "item_id": it.get("itemId"),
@@ -189,6 +228,13 @@ def save_listings(engine, items: list[dict[str, Any]]) -> None:
                 "seller_score": _sanitize(it.get("seller_score")),
                 "trend_score": _sanitize(it.get("trend_score")),
                 "scraped_at": now,
+                "ai_overall_score": _sanitize(it.get("ai_overall_score")),
+                "ai_quality_score": _sanitize(it.get("ai_quality_score")),
+                "ai_pricing_score": _sanitize(it.get("ai_pricing_score")),
+                "ai_trend_score": _sanitize(it.get("ai_trend_score")),
+                "ai_authenticity_risk": _sanitize(it.get("ai_authenticity_risk")),
+                "ai_summary": (it.get("ai_summary") or "")[:8000] if it.get("ai_summary") else None,
+                "ai_authenticity_note": (it.get("ai_authenticity_note") or "")[:4000] if it.get("ai_authenticity_note") else None,
             })
         conn.execute(text("""
             INSERT INTO scrape_metadata (id, last_scraped_at, num_listings) VALUES (1, :at, :n)
@@ -205,7 +251,9 @@ def get_listings(engine) -> list[dict[str, Any]]:
                    condition, condition_normalized, seller_name, seller_feedback_percent,
                    sold_count, sold_count_num, listing_type, url, thumbnail,
                    deal_score, discount_pct, price_value, list_price_value,
-                   condition_score, seller_score, trend_score, scraped_at
+                   condition_score, seller_score, trend_score, scraped_at,
+                   ai_overall_score, ai_quality_score, ai_pricing_score, ai_trend_score,
+                   ai_authenticity_risk, ai_summary, ai_authenticity_note
             FROM listings ORDER BY deal_score DESC
         """)).fetchall()
     return [_row_to_item(r) for r in rows]

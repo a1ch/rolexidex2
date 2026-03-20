@@ -1,11 +1,16 @@
 """
 AI-powered ranking of luxury watch listings using LLM analysis.
 Supports OpenAI and Anthropic. Returns quality, pricing, trend, and overall scores plus short summaries.
+
+Env (optional):
+  ROLEXIDEX_AI_PARALLEL_BATCHES — default 1; set 2–3 to run LLM batch calls concurrently (faster, higher rate-limit use).
 """
 from __future__ import annotations
 
 import json
+import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 
 # Optional: use openai or anthropic
@@ -33,6 +38,21 @@ ANTHROPIC_MODEL_FALLBACKS = (
 
 # Smaller batches = valid JSON + full scores (one huge response often truncates → all 5s).
 AI_BATCH_SIZE = 7
+
+
+def _max_tokens_for_batch(n_listings: int) -> int:
+    """Cap output tokens by batch size — avoids over-allocating on small batches (latency/cost)."""
+    n = max(1, n_listings)
+    # ~300–400 tokens per row of JSON + buffer; stay within model limits.
+    return min(4096, max(512, 280 * n + 320))
+
+
+def _ai_parallel_workers() -> int:
+    try:
+        w = int(os.environ.get("ROLEXIDEX_AI_PARALLEL_BATCHES", "1").strip() or "1")
+    except ValueError:
+        w = 1
+    return max(1, min(4, w))
 
 
 def _get_openai_client(api_key: str) -> OpenAI | None:
@@ -204,7 +224,7 @@ def _default_pad_row() -> dict[str, Any]:
     }
 
 
-def _call_openai_batch(client: Any, models: list[str], prompt: str) -> str:
+def _call_openai_batch(client: Any, models: list[str], prompt: str, *, max_tokens: int) -> str:
     last: Exception | None = None
     for m in models:
         if not m:
@@ -214,7 +234,7 @@ def _call_openai_batch(client: Any, models: list[str], prompt: str) -> str:
                 model=m,
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0.55,
-                max_tokens=4096,
+                max_tokens=max_tokens,
             )
             text = (resp.choices[0].message.content or "").strip()
             if text:
@@ -230,7 +250,7 @@ def _call_openai_batch(client: Any, models: list[str], prompt: str) -> str:
     return ""
 
 
-def _call_anthropic_batch(client: Any, models: list[str], prompt: str) -> str:
+def _call_anthropic_batch(client: Any, models: list[str], prompt: str, *, max_tokens: int) -> str:
     last_err: Exception | None = None
     for m in models:
         if not m:
@@ -238,7 +258,7 @@ def _call_anthropic_batch(client: Any, models: list[str], prompt: str) -> str:
         try:
             msg = client.messages.create(
                 model=m,
-                max_tokens=4096,
+                max_tokens=max_tokens,
                 messages=[{"role": "user", "content": prompt}],
             )
             text = _anthropic_message_text(msg).strip()
@@ -253,6 +273,31 @@ def _call_anthropic_batch(client: Any, models: list[str], prompt: str) -> str:
     if last_err:
         raise last_err
     return ""
+
+
+def _normalize_parsed_batch(parsed: list[dict[str, Any]], batch_len: int) -> list[dict[str, Any]]:
+    if len(parsed) != batch_len:
+        while len(parsed) < batch_len:
+            parsed.append(_default_pad_row())
+        parsed = parsed[:batch_len]
+    return parsed
+
+
+def _run_single_ai_batch(
+    batch: list[dict[str, Any]],
+    start: int,
+    client: Any,
+    models_try: list[str],
+    provider: str,
+) -> tuple[int, list[dict[str, Any]]]:
+    prompt = _build_batch_prompt(batch, start)
+    max_tok = _max_tokens_for_batch(len(batch))
+    if provider == "openai":
+        text = _call_openai_batch(client, models_try, prompt, max_tokens=max_tok)
+    else:
+        text = _call_anthropic_batch(client, models_try, prompt, max_tokens=max_tok)
+    parsed = _normalize_parsed_batch(_parse_ai_response(text, len(batch)), len(batch))
+    return start, parsed
 
 
 def _run_ai_ranking(
@@ -280,21 +325,31 @@ def _run_ai_ranking(
             if m and m not in models_try:
                 models_try.append(m)
 
-    parsed_all: list[dict[str, Any]] = []
-    for start in range(0, len(subset), AI_BATCH_SIZE):
-        batch = subset[start : start + AI_BATCH_SIZE]
-        prompt = _build_batch_prompt(batch, start)
-        if provider == "openai":
-            text = _call_openai_batch(client, models_try, prompt)
-        else:
-            text = _call_anthropic_batch(client, models_try, prompt)
+    batch_starts = list(range(0, len(subset), AI_BATCH_SIZE))
+    workers = _ai_parallel_workers()
 
-        parsed = _parse_ai_response(text, len(batch))
-        if len(parsed) != len(batch):
-            while len(parsed) < len(batch):
-                parsed.append(_default_pad_row())
-            parsed = parsed[: len(batch)]
-        parsed_all.extend(parsed)
+    if workers <= 1 or len(batch_starts) <= 1:
+        parsed_all: list[dict[str, Any]] = []
+        for start in batch_starts:
+            batch = subset[start : start + AI_BATCH_SIZE]
+            _, parsed = _run_single_ai_batch(batch, start, client, models_try, provider)
+            parsed_all.extend(parsed)
+    else:
+        results: list[tuple[int, list[dict[str, Any]]]] = []
+        max_workers = min(workers, len(batch_starts))
+
+        def _job(start: int) -> tuple[int, list[dict[str, Any]]]:
+            batch = subset[start : start + AI_BATCH_SIZE]
+            return _run_single_ai_batch(batch, start, client, models_try, provider)
+
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = {pool.submit(_job, s): s for s in batch_starts}
+            for fut in as_completed(futures):
+                results.append(fut.result())
+        results.sort(key=lambda x: x[0])
+        parsed_all = []
+        for _, p in results:
+            parsed_all.extend(p)
 
     parsed = parsed_all
     if len(parsed) != len(subset):
